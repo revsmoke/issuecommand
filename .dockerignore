@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.env.*
+node_modules
+coverage
+*.log
+*.local
+issuecommand-state.json
+data
+.DS_Store

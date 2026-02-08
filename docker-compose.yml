@@ -1,0 +1,38 @@
+services:
+  issuecommand:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: issuecommand:latest
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HTTP_PORT: 3100
+      STATE_FILE_PATH: /app/data/issuecommand-state.json
+    ports:
+      - "3100:3100"
+    volumes:
+      - issuecommand_data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bun -e 'const p=process.env.HTTP_PORT||3100;const k=process.env.API_KEY||\"\";fetch(\"http://127.0.0.1:\"+p+\"/api/health\",{headers:{Authorization:\"Bearer \"+k}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1));'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 20s
+
+volumes:
+  issuecommand_data:
