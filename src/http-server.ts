@@ -23,6 +23,10 @@ interface RunningHttpServer {
   port: number;
 }
 
+class ClientInputError extends Error {
+  readonly status = 400;
+}
+
 const SSE_HEADERS = {
   'Content-Type': 'text/event-stream',
   'Cache-Control': 'no-cache, no-transform',
@@ -87,6 +91,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
           401,
         );
       }
+      const mutationPrincipal = requiresApiAuth ? getMutationPrincipal(request) : undefined;
 
       if (pathname.startsWith('/api')) {
         const perIpLimit = checkRateLimit(ipLimiter, `ip:${clientIp}`);
@@ -156,7 +161,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
         if (request.method === 'POST' && pathname === '/api/claims') {
           const body = await parseJsonBody(request);
           const agentId = requireString(body, 'agent_id');
-          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          const mutationLimit = checkMutationRateLimit(mutationLimiter, mutationPrincipal, agentId);
           if (mutationLimit) {
             return rateLimitResponse('agent_mutation', mutationLimit);
           }
@@ -172,7 +177,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
         if (request.method === 'POST' && pathname === '/api/next') {
           const body = await parseJsonBody(request);
           const agentId = requireString(body, 'agent_id');
-          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          const mutationLimit = checkMutationRateLimit(mutationLimiter, mutationPrincipal, agentId);
           if (mutationLimit) {
             return rateLimitResponse('agent_mutation', mutationLimit);
           }
@@ -190,7 +195,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
         if (request.method === 'POST' && pathname === '/api/next-work') {
           const body = await parseJsonBody(request);
           const agentId = requireString(body, 'agent_id');
-          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          const mutationLimit = checkMutationRateLimit(mutationLimiter, mutationPrincipal, agentId);
           if (mutationLimit) {
             return rateLimitResponse('agent_mutation', mutationLimit);
           }
@@ -218,7 +223,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
         if (request.method === 'GET' && pathname === '/api/my-work') {
           const agentId = url.searchParams.get('agent_id');
           if (!agentId || !agentId.trim()) {
-            throw new Error('Missing required query parameter: agent_id');
+            throw new ClientInputError('Missing required query parameter: agent_id');
           }
 
           const response = options.service.getMyWork({
@@ -232,7 +237,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
           const claimId = claimPathMatch[1];
           const body = await parseJsonBody(request, { optional: true });
           const agentId = requireString(body, 'agent_id');
-          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          const mutationLimit = checkMutationRateLimit(mutationLimiter, mutationPrincipal, agentId);
           if (mutationLimit) {
             return rateLimitResponse('agent_mutation', mutationLimit);
           }
@@ -250,7 +255,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
           const claimId = claimPathMatch[1];
           const body = await parseJsonBody(request);
           const agentId = requireString(body, 'agent_id');
-          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          const mutationLimit = checkMutationRateLimit(mutationLimiter, mutationPrincipal, agentId);
           if (mutationLimit) {
             return rateLimitResponse('agent_mutation', mutationLimit);
           }
@@ -270,7 +275,7 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
         if (followupPathMatch && request.method === 'PATCH') {
           const body = await parseJsonBody(request);
           const agentId = requireString(body, 'agent_id');
-          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          const mutationLimit = checkMutationRateLimit(mutationLimiter, mutationPrincipal, agentId);
           if (mutationLimit) {
             return rateLimitResponse('agent_mutation', mutationLimit);
           }
@@ -302,19 +307,32 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
 
         return json({ ok: false, error: 'not_found' }, 404);
       } catch (error) {
+        const isClientError = error instanceof ClientInputError;
         options.logger.error('http.request_failed', {
           method: request.method,
           path: pathname,
+          status: isClientError ? error.status : 500,
           message: error instanceof Error ? error.message : String(error),
         });
+
+        if (!isClientError) {
+          return json(
+            {
+              ok: false,
+              error: 'internal_error',
+              message: 'An unexpected server error occurred',
+            },
+            500,
+          );
+        }
 
         return json(
           {
             ok: false,
             error: 'request_failed',
-            message: error instanceof Error ? error.message : String(error),
+            message: error.message,
           },
-          400,
+          error.status,
         );
       }
     },
@@ -487,6 +505,28 @@ function checkRateLimit(
   };
 }
 
+function checkMutationRateLimit(
+  limiter: TokenBucketLimiter | undefined,
+  principal: string | undefined,
+  agentId: string | undefined,
+): { retryAfterSeconds: number; remainingTokens: number } | null {
+  const principalLimit = checkRateLimit(limiter, principal ? `principal:${principal}` : undefined);
+  if (principalLimit) {
+    return principalLimit;
+  }
+
+  return checkRateLimit(limiter, agentId ? `agent:${agentId}` : undefined);
+}
+
+function getMutationPrincipal(request: Request): string | undefined {
+  const value = request.headers.get('authorization');
+  if (!value || !value.trim()) {
+    return undefined;
+  }
+
+  return value.trim();
+}
+
 function getClientIp(request: Request, server: Bun.Server<any>, trustProxy: boolean): string {
   if (trustProxy) {
     // Forwarded headers are safe only when a trusted proxy sanitizes them.
@@ -527,12 +567,18 @@ async function parseJsonBody(
     if (options.optional) {
       return {};
     }
-    throw new Error('Request body is required');
+    throw new ClientInputError('Request body is required');
   }
 
-  const parsed = JSON.parse(text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new ClientInputError('Invalid JSON payload');
+  }
+
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('Expected a JSON object payload');
+    throw new ClientInputError('Expected a JSON object payload');
   }
 
   return parsed as Record<string, unknown>;
@@ -541,7 +587,7 @@ async function parseJsonBody(
 function requireString(body: Record<string, unknown>, key: string): string {
   const value = body[key];
   if (typeof value !== 'string' || !value.trim()) {
-    throw new Error(`Missing or invalid field: ${key}`);
+    throw new ClientInputError(`Missing or invalid field: ${key}`);
   }
 
   return value.trim();
@@ -559,7 +605,7 @@ function optionalString(body: Record<string, unknown>, key: string): string | un
 function requireNumber(body: Record<string, unknown>, key: string): number {
   const value = body[key];
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new Error(`Missing or invalid field: ${key}`);
+    throw new ClientInputError(`Missing or invalid field: ${key}`);
   }
 
   return value;
@@ -592,7 +638,7 @@ function requireStatus(body: Record<string, unknown>, key: string): ClaimStatus 
   ];
 
   if (!validStatuses.includes(status as ClaimStatus)) {
-    throw new Error(`Invalid claim status: ${String(value)}`);
+    throw new ClientInputError(`Invalid claim status: ${String(value)}`);
   }
 
   return status as ClaimStatus;
@@ -622,7 +668,7 @@ function requireFollowupStatus(body: Record<string, unknown>, key: string): Foll
   const validStatuses: FollowupStatus[] = ['queued', 'claimed', 'in_progress', 'done', 'dismissed', 'stale'];
 
   if (!validStatuses.includes(status as FollowupStatus)) {
-    throw new Error(`Invalid follow-up status: ${String(value)}`);
+    throw new ClientInputError(`Invalid follow-up status: ${String(value)}`);
   }
 
   return status as FollowupStatus;

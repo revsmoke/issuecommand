@@ -261,11 +261,9 @@ export interface SystemHealth {
 export interface AppConfig {
   githubToken: string;
   httpPort: number;
-  persistenceBackend: 'sqlite' | 'json';
   sqlitePath: string;
   sqliteBusyTimeoutMs: number;
   sqliteJournalMode: string;
-  migrateJsonToSqlite: boolean;
   webhookDedupeMaxEntries: number;
   webhookEnabled: boolean;
   webhookPath: string;
@@ -276,8 +274,6 @@ export interface AppConfig {
   followupMaxEntries: number;
   historyMaxEntries: number;
   trustProxy: boolean;
-  stateFilePath: string;
-  followupStateFilePath: string;
   syncIntervalMinutes: number;
   allowedRepos: Set<string>;
   logFile?: string;

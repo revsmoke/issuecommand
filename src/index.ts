@@ -9,6 +9,7 @@ import { startMcpServer } from './mcp-server';
 import { SyncService } from './sync';
 import { IssueCommandService } from './issuecommand-service';
 import { initializePersistence } from './persistence/create-persistence';
+import { startFollowupSweepScheduler } from './followup-sweep-scheduler';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -18,10 +19,7 @@ async function main(): Promise<void> {
 
   logger.info('issuecommand.starting', {
     port: config.httpPort,
-    persistence_backend: config.persistenceBackend,
     sqlite_path: config.sqlitePath,
-    state_file_path: config.stateFilePath,
-    followup_state_file_path: config.followupStateFilePath,
     sync_interval_minutes: config.syncIntervalMinutes,
     allowed_repos_count: config.allowedRepos.size,
   });
@@ -119,13 +117,11 @@ async function main(): Promise<void> {
 
   sync.start();
 
-  const followupSweepTimer = setInterval(() => {
-    void followupManager.runStaleSweep().catch((error) => {
-      logger.warn('followup.stale_sweep_failed', {
-        message: error instanceof Error ? error.message : String(error),
-      });
-    });
-  }, Math.max(1, config.syncIntervalMinutes) * 60_000);
+  const followupSweep = startFollowupSweepScheduler({
+    followups: followupManager,
+    logger,
+    intervalMs: Math.max(1, config.syncIntervalMinutes) * 60_000,
+  });
 
   const mcp = await startMcpServer({
     service,
@@ -136,18 +132,27 @@ async function main(): Promise<void> {
     http_port: http.port,
   });
 
+  let shutdownPromise: Promise<void> | undefined;
   const shutdown = async (signal: string): Promise<void> => {
-    logger.info('issuecommand.shutting_down', { signal });
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
 
-    sync.stop();
-    clearInterval(followupSweepTimer);
-    http.stop();
-    await mcp.close();
-    await persistence.flush();
-    await followupPersistence.flush();
-    sqliteStore?.close();
+    shutdownPromise = (async () => {
+      logger.info('issuecommand.shutting_down', { signal });
 
-    process.exit(0);
+      http.stop();
+      await sync.stop();
+      await followupSweep.stop();
+      await mcp.close();
+      await persistence.flush();
+      await followupPersistence.flush();
+      sqliteStore?.close();
+
+      process.exit(0);
+    })();
+
+    return shutdownPromise;
   };
 
   process.on('SIGINT', () => {

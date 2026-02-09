@@ -13,7 +13,7 @@ It runs two transports in one process:
 - Stale detection and optional auto-release.
 - PR follow-up queue from GitHub webhook events (`changes_requested`, PR comments, review comments).
 - GitHub sync for external closures and metadata updates.
-- Crash recovery through durable SQLite persistence (relational row-level writes, with legacy JSON fallback).
+- Crash recovery through durable SQLite persistence (relational row-level writes).
 - Real-time claim/sync events via SSE.
 
 ## Requirements
@@ -50,7 +50,7 @@ bun run start
 
 `HTTP_PORT` defaults to `3100`.
 
-`PERSISTENCE_BACKEND` defaults to `sqlite`, so state is persisted in a local SQLite DB file (`SQLITE_PATH`) and survives restarts/redeployments.
+State is persisted in a local SQLite DB file (`SQLITE_PATH`) and survives restarts/redeployments.
 
 ## Configuration
 
@@ -60,11 +60,9 @@ bun run start
 | `API_KEY` | yes | - | Required bearer token for all HTTP endpoints and SSE |
 | `HTTP_PORT` | no | `3100` | HTTP/SSE port |
 | `TRUST_PROXY` | no | `false` | Trust `x-forwarded-for` / `x-real-ip` for client IP derivation (set `true` only behind a trusted proxy) |
-| `PERSISTENCE_BACKEND` | no | `sqlite` | Persistence backend (`sqlite` or legacy `json`) |
 | `SQLITE_PATH` | no | `./issuecommand.db` | SQLite database file path for durable local persistence |
 | `SQLITE_BUSY_TIMEOUT_MS` | no | `5000` | SQLite busy timeout for concurrent access retries |
 | `SQLITE_JOURNAL_MODE` | no | `WAL` | SQLite journal mode (recommended: `WAL`) |
-| `MIGRATE_JSON_TO_SQLITE` | no | `true` | Auto-import legacy JSON files and snapshot-table state into relational SQLite when DB is empty |
 | `WEBHOOK_DEDUPE_MAX_ENTRIES` | no | `20000` | Max persisted GitHub webhook delivery IDs retained for duplicate protection |
 | `WEBHOOK_ENABLED` | no | `true` | Enable GitHub webhook ingestion endpoint |
 | `WEBHOOK_PATH` | no | `/api/webhooks/github` | Path used for GitHub webhook ingestion |
@@ -75,16 +73,14 @@ bun run start
 | `HISTORY_MAX_ENTRIES` | no | `1000` | Maximum number of completed/released claims retained in memory/state |
 | `FOLLOWUP_STALE_MINUTES` | no | `1440` | Minutes since last update before an active follow-up is marked stale |
 | `FOLLOWUP_MAX_ENTRIES` | no | `2000` | Maximum number of completed/dismissed follow-ups retained in memory/state |
-| `STATE_FILE_PATH` | no | `./issuecommand-state.json` | Legacy JSON claim state path (and migration source when using SQLite) |
-| `FOLLOWUP_STATE_FILE_PATH` | no | `./issuecommand-followups-state.json` | Legacy JSON follow-up state path (and migration source when using SQLite) |
 | `SYNC_INTERVAL_MINUTES` | no | `15` | GitHub reconciliation interval |
 | `ALLOWED_REPOS` | no | `""` | Comma-separated `owner/repo` whitelist |
 | `LOG_FILE` | no | `""` | Optional JSON log output file |
 | `RATE_LIMIT_ENABLED` | no | `true` | Enable in-memory HTTP throttling |
 | `RATE_LIMIT_IP_PER_MINUTE` | no | `120` | Per-IP request refill rate for `/api/*` |
 | `RATE_LIMIT_IP_BURST` | no | `40` | Per-IP burst capacity for `/api/*` |
-| `RATE_LIMIT_AGENT_MUTATIONS_PER_MINUTE` | no | `40` | Per-agent refill rate for mutating claim routes |
-| `RATE_LIMIT_AGENT_MUTATIONS_BURST` | no | `20` | Per-agent burst for mutating claim routes |
+| `RATE_LIMIT_AGENT_MUTATIONS_PER_MINUTE` | no | `40` | Mutation refill rate applied to both authenticated principal and `agent_id` |
+| `RATE_LIMIT_AGENT_MUTATIONS_BURST` | no | `20` | Mutation burst capacity applied to both authenticated principal and `agent_id` |
 | `RATE_LIMIT_SSE_CONNECT_PER_MINUTE` | no | `10` | Per-IP SSE connection-attempt refill rate |
 | `RATE_LIMIT_SSE_CONNECT_BURST` | no | `10` | Per-IP SSE connection-attempt burst |
 
@@ -256,7 +252,7 @@ Stop:
 bun run docker:down
 ```
 
-The container persists state at `/app/data/issuecommand.db` (plus any configured legacy JSON files) via the named volume.
+The container persists state at `/app/data/issuecommand.db` via the named volume.
 
 ### Host Process Manager (PM2)
 
@@ -298,11 +294,9 @@ bun run pm2:stop
         "API_KEY": "shared-secret",
         "HTTP_PORT": "3100",
         "TRUST_PROXY": "false",
-        "PERSISTENCE_BACKEND": "sqlite",
         "SQLITE_PATH": "/absolute/path/to/issuecommand/issuecommand.db",
         "SQLITE_BUSY_TIMEOUT_MS": "5000",
         "SQLITE_JOURNAL_MODE": "WAL",
-        "MIGRATE_JSON_TO_SQLITE": "true",
         "WEBHOOK_DEDUPE_MAX_ENTRIES": "20000",
         "WEBHOOK_ENABLED": "true",
         "WEBHOOK_PATH": "/api/webhooks/github",
@@ -312,8 +306,6 @@ bun run pm2:stop
         "HISTORY_MAX_ENTRIES": "1000",
         "FOLLOWUP_STALE_MINUTES": "1440",
         "FOLLOWUP_MAX_ENTRIES": "2000",
-        "STATE_FILE_PATH": "/absolute/path/to/issuecommand/issuecommand-state.json",
-        "FOLLOWUP_STATE_FILE_PATH": "/absolute/path/to/issuecommand/issuecommand-followups-state.json",
         "SYNC_INTERVAL_MINUTES": "15",
         "ALLOWED_REPOS": "",
         "LOG_FILE": "",
@@ -343,16 +335,11 @@ bun test
 - Logs are emitted on stderr to avoid interfering with MCP stdio protocol output.
 - By default, state is persisted to SQLite (`SQLITE_PATH`) and loaded on startup.
 - SQLite persistence uses relational tables with incremental row updates (active claims/followups, history, and runtime metadata), not full-state blob rewrites.
-- Legacy JSON files and legacy SQLite snapshot namespaces can be auto-imported once into relational SQLite tables when `MIGRATE_JSON_TO_SQLITE=true`.
 - Completed claim history is bounded by `HISTORY_MAX_ENTRIES`; oldest records are trimmed first.
 - Follow-up history is bounded by `FOLLOWUP_MAX_ENTRIES`; oldest records are trimmed first.
 - Webhook delivery dedupe keys are also persisted in SQLite for duplicate protection across restarts.
 - Startup logs include `gh` CLI availability (`github.gh.available` or `github.gh.unavailable`).
 - HTTP rate limiting returns `429` with a `Retry-After` header and JSON body `{ error: \"rate_limited\", scope, retry_after_seconds }`.
+- Mutation routes enforce rate limits by both authenticated principal and provided `agent_id`.
 - `TRUST_PROXY=false` is the safe default; enable it only when a trusted reverse proxy sanitizes forwarding headers.
 - Webhook ingestion accepts either `Authorization: Bearer <API_KEY>` or GitHub `X-Hub-Signature-256` when `GITHUB_WEBHOOK_SECRET` is set.
-- Breaking change: claim mutation routes/tools now require `agent_id`:
-  - HTTP `PATCH /api/claims/:claim_id`
-  - HTTP `DELETE /api/claims/:claim_id`
-  - MCP `update_claim_status`
-  - MCP `release_issue`

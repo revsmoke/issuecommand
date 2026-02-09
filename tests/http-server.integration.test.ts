@@ -19,6 +19,7 @@ interface TestContext {
   apiKey: string;
   stop: () => void;
   tempDir: string;
+  service: IssueCommandService;
 }
 
 interface TestContextOptions {
@@ -665,6 +666,75 @@ describe('HTTP server integration', () => {
     expect(body.scope).toBe('agent_mutation');
   });
 
+  test('mutation limiter also throttles by authenticated principal across different agent_id values', async () => {
+    const context = await createHttpTestContext({
+      issues: [
+        buildIssue({ repo: 'acme/api', number: 30, labels: ['P0'] }),
+        buildIssue({ repo: 'acme/api', number: 31, labels: ['P0'] }),
+      ],
+      rateLimit: {
+        ipPerMinute: 200,
+        ipBurst: 200,
+        agentMutationsPerMinute: 1,
+        agentMutationsBurst: 1,
+      },
+    });
+
+    const first = await fetch(`${context.baseUrl}/api/next`, {
+      method: 'POST',
+      headers: {
+        ...authorizedHeaders(context.apiKey),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        agent_id: 'agent-a',
+        repo: 'acme/api',
+      }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await fetch(`${context.baseUrl}/api/next`, {
+      method: 'POST',
+      headers: {
+        ...authorizedHeaders(context.apiKey),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        agent_id: 'agent-b',
+        repo: 'acme/api',
+      }),
+    });
+    expect(second.status).toBe(429);
+    const payload = (await second.json()) as { error: string; scope: string };
+    expect(payload.error).toBe('rate_limited');
+    expect(payload.scope).toBe('agent_mutation');
+  });
+
+  test('unexpected handler failures return 500 without leaking internals', async () => {
+    const context = await createHttpTestContext();
+    const service = context.service as unknown as {
+      systemHealth: () => Record<string, unknown>;
+    };
+    service.systemHealth = () => {
+      throw new Error('db exploded with sensitive details');
+    };
+
+    const response = await fetch(`${context.baseUrl}/api/health`, {
+      headers: authorizedHeaders(context.apiKey),
+    });
+
+    expect(response.status).toBe(500);
+    const payload = (await response.json()) as {
+      ok: boolean;
+      error: string;
+      message: string;
+    };
+    expect(payload.ok).toBeFalse();
+    expect(payload.error).toBe('internal_error');
+    expect(payload.message).toBe('An unexpected server error occurred');
+    expect(payload.message.includes('sensitive')).toBeFalse();
+  });
+
   test('SSE endpoint uses connection-attempt limiting', async () => {
     const context = await createHttpTestContext({
       rateLimit: {
@@ -749,11 +819,9 @@ async function createHttpTestContext(options: TestContextOptions = {}): Promise<
   const config: AppConfig = {
     githubToken: 'unused-in-tests',
     httpPort: 0,
-    persistenceBackend: 'json',
     sqlitePath: join(tempDir, 'issuecommand.db'),
     sqliteBusyTimeoutMs: 5000,
     sqliteJournalMode: 'WAL',
-    migrateJsonToSqlite: false,
     webhookDedupeMaxEntries: 20000,
     webhookEnabled: true,
     webhookPath: '/api/webhooks/github',
@@ -764,8 +832,6 @@ async function createHttpTestContext(options: TestContextOptions = {}): Promise<
     followupStaleMinutes: 1440,
     followupMaxEntries: 1000,
     historyMaxEntries: 1000,
-    stateFilePath: join(tempDir, 'state.json'),
-    followupStateFilePath: join(tempDir, 'followups-state.json'),
     syncIntervalMinutes: 60,
     allowedRepos: new Set<string>(),
     logFile: undefined,
@@ -812,10 +878,11 @@ async function createHttpTestContext(options: TestContextOptions = {}): Promise<
     baseUrl: `http://127.0.0.1:${server.port}`,
     apiKey,
     stop: () => {
-      sync.stop();
+      void sync.stop();
       server.stop();
     },
     tempDir,
+    service,
   };
 
   contexts.push(context);

@@ -181,4 +181,204 @@ describe('FollowupManager', () => {
     expect(loaded?.seen_source_event_ids.includes('pr_sync:acme/repo#123:sha1')).toBeTrue();
     reopenedStore.close();
   });
+
+  test('dedupes webhook source_event_id across restart after followup completion', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'issuecommand-followup-dedupe-restart-'));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, 'issuecommand.db');
+    const logger = new Logger({ silent: true });
+
+    const store = new SqliteStore({
+      filePath: dbPath,
+      logger,
+      busyTimeoutMs: 1000,
+      journalMode: 'WAL',
+    });
+    await store.initialize();
+
+    const persistence = new SqliteFollowupPersistence({
+      store,
+      logger,
+      maxEntries: 1000,
+      seenSourceIdMaxEntries: 20000,
+    });
+
+    const manager = new FollowupManager({
+      persistence,
+      logger,
+      maxEntries: 1000,
+      staleMinutes: 1440,
+    });
+    await manager.initialize();
+
+    const created = await manager.createFromWebhook({
+      repo: 'acme/repo',
+      pr_number: 500,
+      pr_url: 'https://github.com/acme/repo/pull/500',
+      pr_title: 'Improve dedupe',
+      source_event_type: 'review_comment',
+      source_event_id: 'review:500',
+      summary: 'Please update naming',
+      actionable_comments: ['Please update naming'],
+    });
+    expect(created.ok).toBeTrue();
+
+    const claimed = await manager.claimNextFollowup('agent-1', 'acme/repo');
+    expect(claimed.ok).toBeTrue();
+    if (!claimed.ok || !claimed.work_item) {
+      return;
+    }
+
+    const done = await manager.updateFollowupStatus({
+      work_item_id: claimed.work_item.work_item_id,
+      status: 'done',
+      agent_id: 'agent-1',
+    });
+    expect(done.ok).toBeTrue();
+
+    await persistence.flush();
+    store.close();
+
+    const reopenedStore = new SqliteStore({
+      filePath: dbPath,
+      logger,
+      busyTimeoutMs: 1000,
+      journalMode: 'WAL',
+    });
+    await reopenedStore.initialize();
+    const reopenedPersistence = new SqliteFollowupPersistence({
+      store: reopenedStore,
+      logger,
+      maxEntries: 1000,
+      seenSourceIdMaxEntries: 20000,
+    });
+    const reopenedManager = new FollowupManager({
+      persistence: reopenedPersistence,
+      logger,
+      maxEntries: 1000,
+      staleMinutes: 1440,
+    });
+    await reopenedManager.initialize();
+
+    const duplicate = await reopenedManager.createFromWebhook({
+      repo: 'acme/repo',
+      pr_number: 500,
+      pr_url: 'https://github.com/acme/repo/pull/500',
+      pr_title: 'Improve dedupe',
+      source_event_type: 'review_comment',
+      source_event_id: 'review:500',
+      summary: 'Please update naming',
+      actionable_comments: ['Please update naming'],
+    });
+
+    expect(duplicate.ok).toBeTrue();
+    expect(duplicate.idempotent).toBeTrue();
+    expect(reopenedManager.listFollowups()).toHaveLength(0);
+    expect(reopenedManager.getHistory(10).items).toHaveLength(1);
+
+    reopenedStore.close();
+  });
+
+  test('dedupes seen source_event_id even when original history entry was trimmed', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'issuecommand-followup-dedupe-trimmed-'));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, 'issuecommand.db');
+    const logger = new Logger({ silent: true });
+
+    const store = new SqliteStore({
+      filePath: dbPath,
+      logger,
+      busyTimeoutMs: 1000,
+      journalMode: 'WAL',
+    });
+    await store.initialize();
+
+    const persistence = new SqliteFollowupPersistence({
+      store,
+      logger,
+      maxEntries: 1,
+      seenSourceIdMaxEntries: 20000,
+    });
+
+    const manager = new FollowupManager({
+      persistence,
+      logger,
+      maxEntries: 1,
+      staleMinutes: 1440,
+    });
+    await manager.initialize();
+
+    const createAndComplete = async (sourceEventId: string, prNumber: number): Promise<void> => {
+      const created = await manager.createFromWebhook({
+        repo: 'acme/repo',
+        pr_number: prNumber,
+        pr_url: `https://github.com/acme/repo/pull/${prNumber}`,
+        pr_title: `PR ${prNumber}`,
+        source_event_type: 'review_comment',
+        source_event_id: sourceEventId,
+        summary: `Followup ${prNumber}`,
+        actionable_comments: [`Followup ${prNumber}`],
+      });
+      expect(created.ok).toBeTrue();
+
+      const claimed = await manager.claimNextFollowup('agent-1', 'acme/repo');
+      expect(claimed.ok).toBeTrue();
+      if (!claimed.ok || !claimed.work_item) {
+        return;
+      }
+
+      const done = await manager.updateFollowupStatus({
+        work_item_id: claimed.work_item.work_item_id,
+        status: 'done',
+        agent_id: 'agent-1',
+      });
+      expect(done.ok).toBeTrue();
+    };
+
+    await createAndComplete('review:trimmed-first', 501);
+    await createAndComplete('review:trimmed-second', 502);
+
+    await persistence.flush();
+    store.close();
+
+    const reopenedStore = new SqliteStore({
+      filePath: dbPath,
+      logger,
+      busyTimeoutMs: 1000,
+      journalMode: 'WAL',
+    });
+    await reopenedStore.initialize();
+    const reopenedPersistence = new SqliteFollowupPersistence({
+      store: reopenedStore,
+      logger,
+      maxEntries: 1,
+      seenSourceIdMaxEntries: 20000,
+    });
+    const reopenedManager = new FollowupManager({
+      persistence: reopenedPersistence,
+      logger,
+      maxEntries: 1,
+      staleMinutes: 1440,
+    });
+    await reopenedManager.initialize();
+
+    expect(reopenedManager.getHistory(10).items).toHaveLength(1);
+
+    const duplicate = await reopenedManager.createFromWebhook({
+      repo: 'acme/repo',
+      pr_number: 501,
+      pr_url: 'https://github.com/acme/repo/pull/501',
+      pr_title: 'PR 501',
+      source_event_type: 'review_comment',
+      source_event_id: 'review:trimmed-first',
+      summary: 'Followup 501',
+      actionable_comments: ['Followup 501'],
+    });
+
+    expect(duplicate.ok).toBeTrue();
+    expect(duplicate.idempotent).toBeTrue();
+    expect(reopenedManager.listFollowups()).toHaveLength(0);
+
+    reopenedStore.close();
+  });
 });

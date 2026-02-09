@@ -176,8 +176,8 @@ describe('SyncService', () => {
     sync.start();
     sync.start();
     await Bun.sleep(5);
-    sync.stop();
-    sync.stop();
+    await sync.stop();
+    await sync.stop();
 
     expect(runs).toBe(1);
   });
@@ -265,6 +265,54 @@ describe('SyncService', () => {
     expect(String((errorLog?.details as { message?: string })?.message ?? '')).toContain(
       'forced sync failure',
     );
+  });
+
+  test('stop waits for in-flight sync run completion', async () => {
+    const logger = new Logger({ silent: true });
+    const claims = await createClaimManager(logger);
+    const github = new FakeGitHubClient({
+      repos: [{ full_name: 'acme/api' }],
+      issues: [buildIssue({ repo: 'acme/api', number: 1 })],
+    });
+
+    const sync = new SyncService({
+      claims,
+      github,
+      logger,
+      intervalMinutes: 60,
+      allowedRepos: new Set<string>(),
+    });
+
+    let releaseRun: (() => void) | undefined;
+    (sync as unknown as { runOnce: () => Promise<unknown> }).runOnce = async () => {
+      await new Promise<void>((resolve) => {
+        releaseRun = resolve;
+      });
+      return {
+        repos_scanned: 0,
+        open_issues_seen: 0,
+        newly_opened_issues: 0,
+        externally_closed_claims: 0,
+        metadata_updates: 0,
+      };
+    };
+
+    const runPromise = (sync as unknown as { scheduleSyncRun: (trigger: string) => Promise<void> }).scheduleSyncRun(
+      'startup',
+    );
+    await Bun.sleep(5);
+
+    let stopResolved = false;
+    const stopPromise = sync.stop().then(() => {
+      stopResolved = true;
+    });
+
+    await Bun.sleep(5);
+    expect(stopResolved).toBeFalse();
+
+    releaseRun?.();
+    await Promise.all([runPromise, stopPromise]);
+    expect(stopResolved).toBeTrue();
   });
 });
 

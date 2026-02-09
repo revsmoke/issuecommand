@@ -23,6 +23,7 @@ export class SyncService {
   private readonly knownOpenIssues = new Map<string, Set<number>>();
   private syncRunInFlight = false;
   private syncRunPending = false;
+  private activeRunPromise?: Promise<void>;
   private timer?: ReturnType<typeof setInterval>;
 
   constructor(options: SyncServiceOptions) {
@@ -52,14 +53,14 @@ export class SyncService {
     void this.scheduleSyncRun('startup');
   }
 
-  stop(): void {
-    if (!this.timer) {
-      return;
+  async stop(): Promise<void> {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
     }
 
-    clearInterval(this.timer);
-    this.timer = undefined;
     this.syncRunPending = false;
+    await this.activeRunPromise;
   }
 
   async runOnce(): Promise<SyncReport> {
@@ -178,6 +179,10 @@ export class SyncService {
       return;
     }
 
+    let resolveActiveRun: (() => void) | undefined;
+    this.activeRunPromise = new Promise<void>((resolve) => {
+      resolveActiveRun = resolve;
+    });
     this.syncRunInFlight = true;
     let runTrigger = trigger;
 
@@ -201,6 +206,8 @@ export class SyncService {
       }
     } finally {
       this.syncRunInFlight = false;
+      this.activeRunPromise = undefined;
+      resolveActiveRun?.();
     }
   }
 }

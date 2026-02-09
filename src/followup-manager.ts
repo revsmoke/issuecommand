@@ -152,6 +152,17 @@ export class FollowupManager {
         };
       }
 
+      if (this.hasSeenSourceEventId(input.source_event_id)) {
+        const existing =
+          [...this.active.values()].find((item) => item.source_event_id === input.source_event_id) ??
+          this.history.find((item) => item.source_event_id === input.source_event_id);
+        return {
+          ok: true,
+          idempotent: true,
+          work_item: existing ? structuredClone(existing) : undefined,
+        };
+      }
+
       const nowIso = this.now().toISOString();
       const summary = input.summary.trim() || `${input.source_event_type} for PR #${input.pr_number}`;
       const workItem: PrFollowupRecord = {
@@ -549,6 +560,12 @@ export class FollowupManager {
       this.history.push(record);
     }
     this.trimHistory();
+
+    for (const record of this.history) {
+      if (!this.sourceEventToWorkItemId.has(record.source_event_id)) {
+        this.sourceEventToWorkItemId.set(record.source_event_id, record.work_item_id);
+      }
+    }
 
     for (const sourceId of state.seen_source_event_ids ?? []) {
       if (!sourceId) {

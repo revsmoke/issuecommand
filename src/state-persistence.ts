@@ -92,7 +92,7 @@ export class StatePersistence<T = PersistedState> implements PersistenceDriver<T
         path: this.filePath,
         message: error instanceof Error ? error.message : String(error),
       });
-      return null;
+      throw error;
     }
   }
 

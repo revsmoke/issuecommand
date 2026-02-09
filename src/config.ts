@@ -43,19 +43,6 @@ function parseAllowedRepos(value: string | undefined): Set<string> {
   );
 }
 
-function parsePersistenceBackend(value: string | undefined): 'sqlite' | 'json' {
-  const normalized = value?.trim().toLowerCase();
-  if (!normalized || normalized === 'sqlite') {
-    return 'sqlite';
-  }
-
-  if (normalized === 'json') {
-    return 'json';
-  }
-
-  throw new Error(`Invalid persistence backend: ${value}`);
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const githubToken = env.GITHUB_TOKEN?.trim();
   if (!githubToken) {
@@ -70,11 +57,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     githubToken,
     httpPort: parseNumber('HTTP_PORT', env.HTTP_PORT, 3100),
-    persistenceBackend: parsePersistenceBackend(env.PERSISTENCE_BACKEND),
     sqlitePath: resolve(env.SQLITE_PATH?.trim() || './issuecommand.db'),
     sqliteBusyTimeoutMs: parseNumber('SQLITE_BUSY_TIMEOUT_MS', env.SQLITE_BUSY_TIMEOUT_MS, 5000),
     sqliteJournalMode: env.SQLITE_JOURNAL_MODE?.trim() || 'WAL',
-    migrateJsonToSqlite: parseBoolean(env.MIGRATE_JSON_TO_SQLITE, true),
     webhookDedupeMaxEntries: parseNumber('WEBHOOK_DEDUPE_MAX_ENTRIES', env.WEBHOOK_DEDUPE_MAX_ENTRIES, 20000),
     webhookEnabled: parseBoolean(env.WEBHOOK_ENABLED, true),
     webhookPath: env.WEBHOOK_PATH?.trim() || '/api/webhooks/github',
@@ -89,10 +74,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     followupMaxEntries: parseNumber('FOLLOWUP_MAX_ENTRIES', env.FOLLOWUP_MAX_ENTRIES, 2000),
     historyMaxEntries: parseNumber('HISTORY_MAX_ENTRIES', env.HISTORY_MAX_ENTRIES, 1000),
     trustProxy: parseBoolean(env.TRUST_PROXY, false),
-    stateFilePath: resolve(env.STATE_FILE_PATH?.trim() || './issuecommand-state.json'),
-    followupStateFilePath: resolve(
-      env.FOLLOWUP_STATE_FILE_PATH?.trim() || './issuecommand-followups-state.json',
-    ),
     syncIntervalMinutes: parseNumber('SYNC_INTERVAL_MINUTES', env.SYNC_INTERVAL_MINUTES, 15),
     allowedRepos: parseAllowedRepos(env.ALLOWED_REPOS),
     logFile: env.LOG_FILE?.trim() || undefined,

@@ -12,8 +12,6 @@ interface SqliteStoreOptions {
   webhookDedupeMaxEntries?: number;
 }
 
-const CLAIMS_NAMESPACE = 'claims_state';
-const FOLLOWUPS_NAMESPACE = 'followups_state';
 const DEFAULT_WEBHOOK_DEDUPE_MAX = 20_000;
 const CLAIM_STATE_ROW_ID = 1;
 const FOLLOWUP_STATE_ROW_ID = 1;
@@ -50,12 +48,6 @@ export class SqliteStore {
     db.exec('PRAGMA foreign_keys = ON;');
 
     db.exec(`
-      CREATE TABLE IF NOT EXISTS snapshots (
-        namespace TEXT PRIMARY KEY,
-        payload_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
       CREATE TABLE IF NOT EXISTS claim_runtime_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         version INTEGER NOT NULL,
@@ -148,20 +140,6 @@ export class SqliteStore {
     });
   }
 
-  hasAnyStateSnapshot(): boolean {
-    const db = this.getDb();
-    const row = db
-      .query(
-        `
-          SELECT COUNT(*) as count
-          FROM snapshots
-          WHERE namespace IN (?, ?)
-        `,
-      )
-      .get(CLAIMS_NAMESPACE, FOLLOWUPS_NAMESPACE) as { count: number } | null;
-    return Number(row?.count ?? 0) > 0;
-  }
-
   hasAnyClaimState(): boolean {
     const db = this.getDb();
     const runtime = db
@@ -248,60 +226,6 @@ export class SqliteStore {
       )
       .get() as { count: number } | null;
     return Number(seen?.count ?? 0) > 0;
-  }
-
-  hasSnapshot(namespace: string): boolean {
-    const db = this.getDb();
-    const row = db
-      .query(
-        `
-          SELECT COUNT(*) as count
-          FROM snapshots
-          WHERE namespace = ?
-        `,
-      )
-      .get(namespace) as { count: number } | null;
-
-    return Number(row?.count ?? 0) > 0;
-  }
-
-  loadSnapshot<T>(namespace: string): T | null {
-    const db = this.getDb();
-    const row = db
-      .query(
-        `
-          SELECT payload_json
-          FROM snapshots
-          WHERE namespace = ?
-        `,
-      )
-      .get(namespace) as { payload_json: string } | null;
-
-    if (!row?.payload_json) {
-      return null;
-    }
-
-    const parsed = JSON.parse(row.payload_json) as T;
-    if (!parsed || typeof parsed !== 'object') {
-      throw new Error(`Snapshot ${namespace} has invalid payload`);
-    }
-    return parsed;
-  }
-
-  saveSnapshot(namespace: string, payload: unknown): void {
-    const db = this.getDb();
-    const payloadJson = JSON.stringify(payload);
-    const nowIso = new Date().toISOString();
-
-    db.prepare(
-      `
-        INSERT INTO snapshots (namespace, payload_json, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(namespace) DO UPDATE SET
-          payload_json = excluded.payload_json,
-          updated_at = excluded.updated_at
-      `,
-    ).run(namespace, payloadJson, nowIso);
   }
 
   loadClaimState(): PersistedState | null {
@@ -860,14 +784,6 @@ export class SqliteStore {
     }
     return this.db;
   }
-}
-
-export function claimSnapshotNamespace(): string {
-  return CLAIMS_NAMESPACE;
-}
-
-export function followupSnapshotNamespace(): string {
-  return FOLLOWUPS_NAMESPACE;
 }
 
 function normalizeJournalMode(value: string): string {

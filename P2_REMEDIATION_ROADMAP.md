@@ -1,50 +1,50 @@
-# P2 Remediation Roadmap (Post-P1 Gate)
+# P2 Remediation Roadmap (Updated 2026-02-09)
 
-This document tracks deferred P2 items from `QA_RISK_REGISTER_2026-02-09.md` after the P1 blocker release gate was cleared.
+This file tracks the historical P2 backlog and its current status.
 
-## Scope
+## Historical Scope Status
 
-- IC-QA-003: GH issue listing capped at 200 items
-- IC-QA-004: REST issue details comments capped at first 100
-- IC-QA-005: Claim mutation error-to-HTTP status mapping precision
-- IC-QA-006: Missing CI workflow for typecheck/tests/coverage gates
+### IC-QA-003: Remove GH 200-issue cap
 
-## Work Items
+- [x] Add GH cap-boundary handling with full paginated REST fallback in `src/github.ts`.
+- [x] Preserve GH-first behavior while ensuring complete enumeration when cap is reached.
+- [x] Add tests proving >200 issues can be surfaced through fallback behavior.
+- [x] Validate `nextIssue` still sorts by priority then age over returned candidates.
 
-### 1) IC-QA-003: Remove GH 200-issue cap
+### IC-QA-004: Paginate issue comments in REST details path
 
-- [ ] Add paging strategy for `gh issue list` path in `src/github.ts`.
-- [ ] Keep existing GH-first behavior; preserve REST fallback.
-- [ ] Add tests proving >200 open issues can be enumerated.
-- [ ] Confirm `nextIssue` selection remains priority/age-correct across full set.
+- [x] REST comments now paginate with `per_page=100` until exhaustion in `src/github.ts`.
+- [x] Add tests for multi-page comment retrieval.
+- [x] Validate output parity with GH issue-details path contract.
 
-## 2) IC-QA-004: Paginate issue comments in REST details path
+### IC-QA-005: Tighten claim mutation HTTP status contract
 
-- [ ] Update REST comment retrieval in `src/github.ts` to iterate pages until exhaustion.
-- [ ] Add tests covering multi-page comment fetches.
-- [ ] Validate shape parity with GH path comments output.
+- [x] Claim mutation reason-to-status mapping audited and implemented in `src/http-server.ts`.
+- [x] `claim_not_found -> 404`.
+- [x] `agent_mismatch` / `invalid_transition` / `already_claimed -> 409`.
+- [x] Malformed payload / client validation errors -> `400`.
+- [x] Route-level tests cover reason-specific branches.
 
-## 3) IC-QA-005: Tighten claim mutation HTTP status contract
+### IC-QA-006: CI quality gate
 
-- [ ] Audit claim mutation responses in `src/http-server.ts`.
-- [ ] Ensure stable mapping:
-  - `claim_not_found` -> 404
-  - `agent_mismatch` -> 409
-  - `invalid_transition` -> 409
-  - malformed payload -> 400
-- [ ] Add route-level tests for each reason branch.
+- [x] GitHub Actions workflow added at `.github/workflows/ci.yml`.
+- [x] Runs `bun install --frozen-lockfile`, `bun run typecheck`, `bun test --coverage`.
+- [x] Workflow fails on command failure.
+- [x] Coverage summary artifact upload enabled.
 
-## 4) IC-QA-006: Add CI quality gate
+## Additional Completion Wave (Post-Review)
 
-- [ ] Add GitHub Actions workflow under `.github/workflows/ci.yml`.
-- [ ] Run `bun install`, `bun run typecheck`, `bun test --coverage`.
-- [ ] Fail workflow on command failure.
-- [ ] Publish coverage artifact for traceability.
+- [x] Fixed follow-up dedupe regression across restart/history trimming (`src/followup-manager.ts`).
+- [x] Added shutdown-safe sync/follow-up background stop semantics (`src/sync.ts`, `src/followup-sweep-scheduler.ts`, `src/index.ts`).
+- [x] Hardened HTTP error contract (`400` client validation vs `500` internal) with no internal message leakage.
+- [x] Added mutation throttling keyed to authenticated principal in addition to `agent_id`.
+- [x] Enforced fail-fast behavior on corrupted JSON state loader (`src/state-persistence.ts`).
+- [x] Simplified runtime to SQLite-only persistence initialization (`src/persistence/create-persistence.ts`, config/docs/tests).
 
-## Exit Criteria
+## Current Exit Criteria
 
-- [ ] `bun run typecheck` passes.
-- [ ] `bun test` passes.
-- [ ] New/updated tests cover IC-QA-003/004/005 scenarios.
-- [ ] CI workflow runs successfully on PR and main.
-- [ ] QA risk register updated with P2 status and verification evidence.
+- [x] `bun run typecheck` passes.
+- [x] `bun test` passes.
+- [x] `bun test --coverage` passes.
+- [x] Regression tests added for post-review fixes.
+- [x] Notes and risk documentation updated to reflect current codebase state.
