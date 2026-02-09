@@ -199,6 +199,22 @@ describe('HTTP server integration', () => {
     expect(patchOwnerPayload.ok).toBeTrue();
     expect(patchOwnerPayload.claim?.status).toBe('in_progress');
 
+    const patchInvalidTransition = await fetch(`${context.baseUrl}/api/claims/${claimId}`, {
+      method: 'PATCH',
+      headers: {
+        ...authorizedHeaders(context.apiKey),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        agent_id: 'agent-owner',
+        status: 'claimed',
+      }),
+    });
+    expect(patchInvalidTransition.status).toBe(409);
+    const patchInvalidTransitionPayload = (await patchInvalidTransition.json()) as { ok: boolean; reason?: string };
+    expect(patchInvalidTransitionPayload.ok).toBeFalse();
+    expect(patchInvalidTransitionPayload.reason).toBe('invalid_transition');
+
     const deleteOwner = await fetch(`${context.baseUrl}/api/claims/${claimId}`, {
       method: 'DELETE',
       headers: {
