@@ -55,6 +55,7 @@ Confidence score scale:
 - Confidence: `0.96`
 - Category: Security, Correctness
 - Title: Claim mutation authorization is not bound to claim ownership
+- Status (2026-02-09): `Resolved` in P1 blocker remediation wave (branch `main`, commit `fde2f89`) with HTTP/MCP ownership enforcement and regression tests.
 - Evidence:
   - `/Users/twoedge/Dev/issuecommand/src/http-server.ts:244`
   - `/Users/twoedge/Dev/issuecommand/src/http-server.ts:266`
@@ -84,6 +85,7 @@ Confidence score scale:
 - Confidence: `0.91`
 - Category: Reliability, Concurrency
 - Title: Sync scheduler can run overlapping reconciliations and does not catch run failures
+- Status (2026-02-09): `Resolved` in P1 blocker remediation wave (branch `main`, commit `fde2f89`) with single-flight scheduler guard and failure capture logging.
 - Evidence:
   - `/Users/twoedge/Dev/issuecommand/src/sync.ts:46`
   - `/Users/twoedge/Dev/issuecommand/src/sync.ts:50`
@@ -109,6 +111,7 @@ Confidence score scale:
 - Confidence: `0.88`
 - Category: Correctness, Scalability
 - Title: GH issue listing path is hard-capped to 200 issues
+- Status (2026-02-09): `Resolved` in P2 code-fix wave by GH-cap boundary fallback to paginated REST issue listing, with regression coverage in `tests/github.test.ts`.
 - Evidence:
   - `/Users/twoedge/Dev/issuecommand/src/github.ts:216`
   - `/Users/twoedge/Dev/issuecommand/src/github.ts:217`
@@ -131,6 +134,7 @@ Confidence score scale:
 - Confidence: `0.82`
 - Category: Correctness
 - Title: REST issue details only fetch first 100 comments
+- Status (2026-02-09): `Resolved` in P2 code-fix wave by paginating REST comments (`per_page=100`, page loop until terminal batch), with regression coverage in `tests/github.test.ts`.
 - Evidence:
   - `/Users/twoedge/Dev/issuecommand/src/github.ts:360`
   - `/Users/twoedge/Dev/issuecommand/src/github.ts:361`
@@ -151,6 +155,7 @@ Confidence score scale:
 - Confidence: `0.84`
 - Category: Contract
 - Title: Claim mutation endpoints flatten distinct failures into coarse HTTP statuses
+- Status (2026-02-09): `Resolved` in P1/P2 remediation with explicit claim-mutation status mapping and route-level regression coverage for `claim_not_found`, `agent_mismatch`, `invalid_transition`, and malformed payloads.
 - Evidence:
   - `/Users/twoedge/Dev/issuecommand/src/http-server.ts:250`
   - `/Users/twoedge/Dev/issuecommand/src/http-server.ts:273`
@@ -175,6 +180,7 @@ Confidence score scale:
 - Confidence: `0.94`
 - Category: Operability, Tests
 - Title: No CI workflow enforces quality gates
+- Status (2026-02-09): `Resolved` via merged PR #2 adding `.github/workflows/ci.yml` (`typecheck`, `bun test --coverage`, coverage artifact upload on `pull_request` and `push` to `main`).
 - Evidence:
   - Repository lacks `/Users/twoedge/Dev/issuecommand/.github/workflows/*`
 - Reproduction:
@@ -228,6 +234,5 @@ Remaining critical gaps:
 
 ## 6) Release Recommendation
 
-- Decision: `NO-GO`
-- Reason: unresolved `P1` findings (`IC-QA-001`, `IC-QA-002`) violate release gate policy.
-
+- Decision: `GO`
+- Reason: release-blocking findings (`P0/P1`) are resolved and validated by passing `bun run typecheck` and `bun test`; remaining tracked items in this register are now resolved in merged or pending-remediation PR waves.

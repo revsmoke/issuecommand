@@ -64,6 +64,9 @@ interface RestIssueComment {
   };
 }
 
+const GH_ISSUE_LIST_LIMIT = 200;
+const REST_PAGE_SIZE = 100;
+
 export class GitHubService implements GitHubClient {
   private readonly token: string;
   private readonly logger: Logger;
@@ -149,6 +152,14 @@ export class GitHubService implements GitHubClient {
 
     try {
       const issues = await this.listOpenIssuesViaGh(repo, options);
+      if (issues.length >= GH_ISSUE_LIST_LIMIT) {
+        this.logger.warn('github.gh_issue_list_hit_limit_falling_back_to_rest', {
+          repo,
+          issue_count: issues.length,
+          limit: GH_ISSUE_LIST_LIMIT,
+        });
+        return this.listOpenIssuesViaRest(repo, options);
+      }
       return issues;
     } catch (error) {
       this.logger.warn('github.gh_issue_list_failed_falling_back_to_rest', {
@@ -214,7 +225,7 @@ export class GitHubService implements GitHubClient {
       '--state',
       'open',
       '--limit',
-      '200',
+      String(GH_ISSUE_LIST_LIMIT),
       '--json',
       'number,title,body,labels,assignees,milestone,createdAt,updatedAt,url',
     ];
@@ -268,7 +279,7 @@ export class GitHubService implements GitHubClient {
     while (true) {
       const query = new URLSearchParams({
         state: 'open',
-        per_page: '100',
+        per_page: String(REST_PAGE_SIZE),
         page: String(page),
       });
 
@@ -287,7 +298,7 @@ export class GitHubService implements GitHubClient {
 
       issues.push(...normalized);
 
-      if (batch.length < 100) {
+      if (batch.length < REST_PAGE_SIZE) {
         break;
       }
 
@@ -357,9 +368,21 @@ export class GitHubService implements GitHubClient {
     const { owner, name } = parseRepo(repo);
     const issue = await this.rest<RestIssue>(`/repos/${owner}/${name}/issues/${issueNumber}`);
 
-    const comments = await this.rest<RestIssueComment[]>(
-      `/repos/${owner}/${name}/issues/${issueNumber}/comments?per_page=100`,
-    );
+    const comments: RestIssueComment[] = [];
+    let page = 1;
+
+    while (true) {
+      const batch = await this.rest<RestIssueComment[]>(
+        `/repos/${owner}/${name}/issues/${issueNumber}/comments?per_page=${REST_PAGE_SIZE}&page=${page}`,
+      );
+      comments.push(...batch);
+
+      if (batch.length < REST_PAGE_SIZE) {
+        break;
+      }
+
+      page += 1;
+    }
 
     return {
       ...this.mapRestIssue(repo, issue),

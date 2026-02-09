@@ -182,6 +182,83 @@ describe('GitHubService', () => {
     expect(calls.some((url) => url.includes('labels=bug'))).toBeTrue();
   });
 
+  test('listOpenIssues falls back to REST when gh result hits list cap', async () => {
+    const calls: string[] = [];
+    const service = new GitHubService({
+      token: 'test-token',
+      logger: new Logger({ silent: true }),
+      allowedRepos: new Set<string>(),
+      execCommandFn: async (_command, args) => {
+        if (args[0] === 'issue' && args[1] === 'list') {
+          return {
+            code: 0,
+            stdout: JSON.stringify(
+              Array.from({ length: 200 }, (_, index) => ({
+                number: index + 1,
+                title: `Issue ${index + 1}`,
+                body: 'Details',
+                labels: [{ name: 'bug' }],
+                assignees: [{ login: 'dev1' }],
+                createdAt: '2026-02-01T00:00:00.000Z',
+                updatedAt: '2026-02-02T00:00:00.000Z',
+                url: `https://github.com/acme/api/issues/${index + 1}`,
+              })),
+            ),
+            stderr: '',
+          };
+        }
+
+        return {
+          code: 1,
+          stdout: '',
+          stderr: 'unexpected command',
+        };
+      },
+    });
+
+    setMockFetch(async (input) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      calls.push(url);
+
+      if (url.includes('/repos/acme/api/issues?')) {
+        const page = new URL(url).searchParams.get('page');
+        if (page === '1') {
+          return jsonResponse([
+            {
+              number: 501,
+              title: 'Issue from REST page 1',
+              body: 'details',
+              state: 'open',
+              labels: [{ name: 'bug' }],
+              assignees: [{ login: 'dev2' }],
+              milestone: { title: 'M1' },
+              comments_url: 'https://api.github.com/comments',
+              created_at: '2026-02-01T00:00:00.000Z',
+              updated_at: '2026-02-02T00:00:00.000Z',
+              html_url: 'https://github.com/acme/api/issues/501',
+            },
+          ]);
+        }
+
+        if (page === '2') {
+          return jsonResponse([]);
+        }
+      }
+
+      throw new Error(`Unexpected URL in test: ${url}`);
+    });
+
+    const issues = await service.listOpenIssues('acme/api', {
+      label: 'bug',
+      milestone: 'M1',
+    });
+
+    expect(issues).toHaveLength(1);
+    expect(issues[0].number).toBe(501);
+    expect(calls.some((url) => url.includes('labels=bug'))).toBeTrue();
+    expect(calls.some((url) => url.includes('milestone=M1'))).toBeTrue();
+  });
+
   test('getIssueDetails falls back to REST when gh fails', async () => {
     const service = new GitHubService({
       token: 'test-token',
@@ -235,6 +312,79 @@ describe('GitHubService', () => {
     expect(issue.comments).toHaveLength(1);
     expect(issue.comments[0].author).toBe('reviewer1');
     expect(calls).toHaveLength(2);
+  });
+
+  test('getIssueDetails paginates REST comments beyond first 100', async () => {
+    const service = new GitHubService({
+      token: 'test-token',
+      logger: new Logger({ silent: true }),
+      allowedRepos: new Set<string>(),
+      execCommandFn: async () => ({
+        code: 1,
+        stdout: '',
+        stderr: 'gh unavailable',
+      }),
+    });
+
+    setMockFetch(async (input) => {
+      const url = typeof input === 'string' ? input : input.toString();
+
+      if (url.endsWith('/repos/acme/api/issues/42')) {
+        return jsonResponse({
+          number: 42,
+          title: 'REST detail',
+          body: 'body',
+          state: 'open',
+          labels: [{ name: 'P1' }],
+          assignees: [{ login: 'dev3' }],
+          milestone: null,
+          comments_url: 'https://api.github.com/comments',
+          created_at: '2026-02-01T00:00:00.000Z',
+          updated_at: '2026-02-02T00:00:00.000Z',
+          html_url: 'https://github.com/acme/api/issues/42',
+        });
+      }
+
+      if (url.includes('/repos/acme/api/issues/42/comments?')) {
+        const page = new URL(url).searchParams.get('page');
+        if (page === '1') {
+          return jsonResponse(
+            Array.from({ length: 100 }, (_, index) => ({
+              body: `Comment ${index + 1}`,
+              created_at: `2026-02-${String((index % 28) + 1).padStart(2, '0')}T00:00:00.000Z`,
+              html_url: `https://github.com/acme/api/issues/42#issuecomment-${index + 1}`,
+              user: { login: `reviewer${index + 1}` },
+            })),
+          );
+        }
+
+        if (page === '2') {
+          return jsonResponse([
+            {
+              body: 'Comment 101',
+              created_at: '2026-02-20T00:00:00.000Z',
+              html_url: 'https://github.com/acme/api/issues/42#issuecomment-101',
+              user: { login: 'reviewer101' },
+            },
+            {
+              body: 'Comment 102',
+              created_at: '2026-02-21T00:00:00.000Z',
+              html_url: 'https://github.com/acme/api/issues/42#issuecomment-102',
+              user: { login: 'reviewer102' },
+            },
+          ]);
+        }
+      }
+
+      throw new Error(`Unexpected URL in test: ${url}`);
+    });
+
+    const issue = await service.getIssueDetails('acme/api', 42);
+
+    expect(issue.number).toBe(42);
+    expect(issue.comments).toHaveLength(102);
+    expect(issue.comments[0].author).toBe('reviewer1');
+    expect(issue.comments[101].author).toBe('reviewer102');
   });
 
   test('listRepos with includeCounts=false does not call search API', async () => {
