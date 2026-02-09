@@ -1,7 +1,11 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { Logger } from './logger';
-import { StatePersistence } from './state-persistence';
+import {
+  ClaimIncrementalPersistence,
+  PersistenceDriver,
+  isClaimIncrementalPersistence,
+} from './state-persistence';
 import {
   ClaimEvent,
   ClaimFilters,
@@ -20,7 +24,8 @@ import {
 interface ClaimManagerOptions {
   claimTimeoutMinutes: number;
   staleAutoReleaseMinutes: number;
-  persistence: StatePersistence;
+  historyMaxEntries: number;
+  persistence: PersistenceDriver<PersistedState>;
   logger: Logger;
   now?: () => Date;
 }
@@ -40,7 +45,9 @@ const TRANSITIONS: Record<ClaimStatus, ClaimStatus[]> = {
 export class ClaimManager {
   private readonly claimTimeoutMinutes: number;
   private readonly staleAutoReleaseMinutes: number;
-  private readonly persistence: StatePersistence;
+  private readonly historyMaxEntries: number;
+  private readonly persistence: PersistenceDriver<PersistedState>;
+  private readonly incrementalPersistence?: ClaimIncrementalPersistence;
   private readonly logger: Logger;
   private readonly now: () => Date;
   private readonly events = new EventEmitter();
@@ -55,7 +62,11 @@ export class ClaimManager {
   constructor(options: ClaimManagerOptions) {
     this.claimTimeoutMinutes = options.claimTimeoutMinutes;
     this.staleAutoReleaseMinutes = options.staleAutoReleaseMinutes;
+    this.historyMaxEntries = Math.max(0, options.historyMaxEntries);
     this.persistence = options.persistence;
+    this.incrementalPersistence = isClaimIncrementalPersistence(options.persistence)
+      ? options.persistence
+      : undefined;
     this.logger = options.logger;
     this.now = options.now ?? (() => new Date());
   }
@@ -133,7 +144,9 @@ export class ClaimManager {
 
   setLastGithubSyncAt(timestamp: string): void {
     this.lastGithubSyncAt = timestamp;
-    this.persistence.scheduleSave(this.buildStateSnapshot());
+    this.persistClaimMutation((incremental) => {
+      incremental.upsertClaimRuntime(this.getRuntimeMetadata());
+    });
   }
 
   async claimIssue(request: ClaimRequest): Promise<ClaimOperationResult> {
@@ -194,7 +207,10 @@ export class ClaimManager {
         issue_number: claim.issue_number,
         agent_id: claim.agent_id,
       });
-      this.persistence.scheduleSave(this.buildStateSnapshot());
+      this.persistClaimMutation((incremental) => {
+        incremental.upsertActiveClaim(claim);
+        incremental.upsertClaimRuntime(this.getRuntimeMetadata());
+      });
 
       return {
         ok: true,
@@ -231,14 +247,26 @@ export class ClaimManager {
         };
       }
 
-      if (request.agent_id && freshClaim.agent_id !== request.agent_id) {
-        return {
-          ok: false,
-          reason: 'agent_mismatch',
-          message: `Claim ${request.claim_id} belongs to ${freshClaim.agent_id}`,
-          owner_agent_id: freshClaim.agent_id,
-          claim: structuredClone(freshClaim),
-        };
+      const source = request.source ?? 'agent';
+      if (source === 'agent') {
+        const agentId = request.agent_id?.trim();
+        if (!agentId) {
+          return {
+            ok: false,
+            reason: 'invalid_transition',
+            message: 'agent_id is required for agent claim release',
+          };
+        }
+
+        if (freshClaim.agent_id !== agentId) {
+          return {
+            ok: false,
+            reason: 'agent_mismatch',
+            message: `Claim ${request.claim_id} belongs to ${freshClaim.agent_id}`,
+            owner_agent_id: freshClaim.agent_id,
+            claim: structuredClone(freshClaim),
+          };
+        }
       }
 
       return this.applyTransitionLocked(freshClaim, {
@@ -270,6 +298,28 @@ export class ClaimManager {
           reason: 'claim_not_found',
           message: `Claim ${request.claim_id} not found`,
         };
+      }
+
+      const source = request.source ?? 'agent';
+      if (source === 'agent') {
+        const agentId = request.agent_id?.trim();
+        if (!agentId) {
+          return {
+            ok: false,
+            reason: 'invalid_transition',
+            message: 'agent_id is required for agent claim status updates',
+          };
+        }
+
+        if (freshClaim.agent_id !== agentId) {
+          return {
+            ok: false,
+            reason: 'agent_mismatch',
+            message: `Claim ${request.claim_id} belongs to ${freshClaim.agent_id}`,
+            owner_agent_id: freshClaim.agent_id,
+            claim: structuredClone(freshClaim),
+          };
+        }
       }
 
       return this.applyTransitionLocked(freshClaim, request);
@@ -331,7 +381,9 @@ export class ClaimManager {
 
       if (metadataUpdated) {
         claim.last_updated = this.now().toISOString();
-        this.persistence.scheduleSave(this.buildStateSnapshot());
+        this.persistClaimMutation((incremental) => {
+          incremental.upsertActiveClaim(claim);
+        });
       }
 
       if (input.state === 'closed') {
@@ -472,6 +524,7 @@ export class ClaimManager {
       this.activeClaims.delete(claim.claim_id);
       this.issueToClaimId.delete(issueKey(claim.repo, claim.issue_number));
       this.history.unshift(structuredClone(claim));
+      this.trimHistory();
     }
 
     const eventType = this.resolveEventType(request.status, source, request.note);
@@ -489,7 +542,16 @@ export class ClaimManager {
       source,
     });
 
-    this.persistence.scheduleSave(this.buildStateSnapshot());
+    this.persistClaimMutation((incremental) => {
+      if (isTerminalStatus(claim.status)) {
+        incremental.deleteActiveClaim(claim.claim_id);
+        incremental.upsertClaimHistory(claim);
+        incremental.trimClaimHistory(this.historyMaxEntries);
+        return;
+      }
+
+      incremental.upsertActiveClaim(claim);
+    });
 
     return {
       ok: true,
@@ -574,6 +636,7 @@ export class ClaimManager {
     for (const historicClaim of state.history ?? []) {
       this.history.push(historicClaim);
     }
+    this.trimHistory();
 
     this.totalClaims = state.total_claims ?? state.active_claims?.length ?? 0;
     this.startedAt = state.started_at ?? this.startedAt;
@@ -589,6 +652,41 @@ export class ClaimManager {
       active_claims: [...this.activeClaims.values()].map((claim) => structuredClone(claim)),
       history: this.history.map((claim) => structuredClone(claim)),
     };
+  }
+
+  private getRuntimeMetadata(): {
+    version: number;
+    started_at: string;
+    total_claims: number;
+    last_github_sync_at?: string;
+  } {
+    return {
+      version: STATE_VERSION,
+      started_at: this.startedAt,
+      total_claims: this.totalClaims,
+      last_github_sync_at: this.lastGithubSyncAt,
+    };
+  }
+
+  private persistClaimMutation(
+    applyIncremental: (incremental: ClaimIncrementalPersistence) => void,
+  ): void {
+    if (this.incrementalPersistence) {
+      this.incrementalPersistence.runClaimTransaction(() => {
+        applyIncremental(this.incrementalPersistence!);
+      });
+      return;
+    }
+
+    this.persistence.scheduleSave(this.buildStateSnapshot());
+  }
+
+  private trimHistory(): void {
+    if (this.history.length <= this.historyMaxEntries) {
+      return;
+    }
+
+    this.history.length = this.historyMaxEntries;
   }
 
   private async withIssueLock<T>(key: string, fn: () => Promise<T>): Promise<T> {

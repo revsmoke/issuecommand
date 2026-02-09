@@ -1,19 +1,27 @@
 import { ClaimManager } from './claim-manager';
+import { FollowupManager } from './followup-manager';
 import { GitHubClient } from './github';
 import { Logger } from './logger';
 import {
   ClaimFilters,
   ClaimOperationResult,
   ClaimRecord,
+  FollowupFilters,
+  FollowupOperationResult,
+  FollowupStatus,
   GitHubIssue,
   HistoryPage,
   ListIssueOptions,
+  MyWorkResponse,
+  NextWorkResult,
+  PrFollowupRecord,
   RepoSummary,
   SystemHealth,
 } from './types';
 
 interface IssueCommandServiceOptions {
   claims: ClaimManager;
+  followups?: FollowupManager;
   github: GitHubClient;
   logger: Logger;
   autoCloseGithubIssue: boolean;
@@ -26,12 +34,14 @@ interface NextIssueRequest extends ListIssueOptions {
 
 export class IssueCommandService {
   private readonly claims: ClaimManager;
+  private readonly followups?: FollowupManager;
   private readonly github: GitHubClient;
   private readonly logger: Logger;
   private readonly autoCloseGithubIssue: boolean;
 
   constructor(options: IssueCommandServiceOptions) {
     this.claims = options.claims;
+    this.followups = options.followups;
     this.github = options.github;
     this.logger = options.logger;
     this.autoCloseGithubIssue = options.autoCloseGithubIssue;
@@ -132,9 +142,46 @@ export class IssueCommandService {
     };
   }
 
+  async nextWork(input: NextIssueRequest): Promise<NextWorkResult> {
+    if (this.followups) {
+      const followupResult = await this.followups.claimNextFollowup(input.agent_id, input.repo);
+      if (followupResult.ok && followupResult.work_item) {
+        return {
+          ok: true,
+          kind: 'pr_followup',
+          work_item: followupResult.work_item,
+        };
+      }
+
+      if (!followupResult.ok && followupResult.reason !== 'no_followup_available') {
+        return {
+          ok: false,
+          reason: followupResult.reason,
+          message: followupResult.message,
+        };
+      }
+    }
+
+    const nextIssue = await this.nextIssue(input);
+    if (!nextIssue.ok || !nextIssue.claim || !nextIssue.issue) {
+      return {
+        ok: false,
+        reason: nextIssue.reason,
+        message: nextIssue.message,
+      };
+    }
+
+    return {
+      ok: true,
+      kind: 'issue',
+      claim: nextIssue.claim,
+      issue: nextIssue.issue,
+    };
+  }
+
   async releaseIssue(input: {
     claim_id: string;
-    agent_id?: string;
+    agent_id: string;
     reason?: string;
   }): Promise<ClaimOperationResult> {
     return this.claims.releaseIssue({
@@ -147,12 +194,14 @@ export class IssueCommandService {
 
   async updateClaimStatus(input: {
     claim_id: string;
+    agent_id: string;
     status: ClaimRecord['status'];
     note?: string;
     pr_url?: string;
   }): Promise<ClaimOperationResult & { issue_closed?: boolean; issue_close_error?: string }> {
     const result = await this.claims.updateClaimStatus({
       claim_id: input.claim_id,
+      agent_id: input.agent_id,
       status: input.status,
       note: input.note,
       pr_url: input.pr_url,
@@ -201,6 +250,41 @@ export class IssueCommandService {
   getClaims(filters: ClaimFilters = {}): { claims: ClaimRecord[] } {
     return {
       claims: this.claims.getActiveClaims(filters),
+    };
+  }
+
+  getFollowups(filters: FollowupFilters = {}): { followups: PrFollowupRecord[] } {
+    return {
+      followups: this.followups ? this.followups.listFollowups(filters) : [],
+    };
+  }
+
+  async updateFollowupStatus(input: {
+    work_item_id: string;
+    status: FollowupStatus;
+    note?: string;
+    agent_id: string;
+  }): Promise<FollowupOperationResult> {
+    if (!this.followups) {
+      return {
+        ok: false,
+        reason: 'unknown',
+        message: 'PR follow-up workflow is not configured',
+      };
+    }
+
+    return this.followups.updateFollowupStatus({
+      ...input,
+      source: 'agent',
+    });
+  }
+
+  getMyWork(input: { agent_id: string }): { work: MyWorkResponse } {
+    return {
+      work: {
+        claims: this.claims.getActiveClaims({ agent_id: input.agent_id }),
+        followups: this.followups ? this.followups.getMyFollowups(input.agent_id) : [],
+      },
     };
   }
 

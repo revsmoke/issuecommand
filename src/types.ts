@@ -7,6 +7,16 @@ export type ClaimStatus =
   | 'released'
   | 'stale';
 
+export type WorkItemType = 'issue' | 'pr_followup';
+
+export type FollowupStatus = 'queued' | 'claimed' | 'in_progress' | 'done' | 'dismissed' | 'stale';
+
+export type FollowupSourceEventType =
+  | 'review_changes_requested'
+  | 'review_comment'
+  | 'pr_comment'
+  | 'pr_synchronize';
+
 export interface StatusEntry {
   status: ClaimStatus;
   timestamp: string;
@@ -82,10 +92,61 @@ export interface ReleaseRequest {
 
 export interface UpdateClaimStatusRequest {
   claim_id: string;
+  agent_id?: string;
   status: ClaimStatus;
   note?: string;
   pr_url?: string;
   source?: 'agent' | 'sync';
+}
+
+export interface FollowupStatusEntry {
+  status: FollowupStatus;
+  timestamp: string;
+  note?: string;
+}
+
+export interface PrFollowupRecord {
+  work_item_id: string;
+  repo: string;
+  pr_number: number;
+  pr_url: string;
+  pr_title: string;
+  source_event_type: FollowupSourceEventType;
+  source_event_id: string;
+  source_delivery_id?: string;
+  requested_by?: string;
+  summary: string;
+  actionable_comments: string[];
+  status: FollowupStatus;
+  created_at: string;
+  last_updated: string;
+  claimed_by_agent_id?: string;
+  claimed_at?: string;
+  done_at?: string;
+  dismiss_reason?: string;
+  status_history: FollowupStatusEntry[];
+}
+
+export interface FollowupFilters {
+  repo?: string;
+  status?: FollowupStatus;
+  claimed_by_agent_id?: string;
+  pr_number?: number;
+}
+
+export interface FollowupOperationResult {
+  ok: boolean;
+  work_item?: PrFollowupRecord;
+  idempotent?: boolean;
+  reason?:
+    | 'not_found'
+    | 'already_claimed'
+    | 'invalid_transition'
+    | 'agent_mismatch'
+    | 'no_followup_available'
+    | 'unknown';
+  message?: string;
+  owner_agent_id?: string;
 }
 
 export interface ClaimOperationResult {
@@ -110,12 +171,48 @@ export interface ClaimFilters {
   status?: ClaimStatus;
 }
 
+export interface FollowupHistoryPage {
+  items: PrFollowupRecord[];
+  next_cursor?: string;
+}
+
+export interface MyWorkResponse {
+  claims: ClaimRecord[];
+  followups: PrFollowupRecord[];
+}
+
+export type NextWorkResult =
+  | {
+      ok: true;
+      kind: 'pr_followup';
+      work_item: PrFollowupRecord;
+    }
+  | {
+      ok: true;
+      kind: 'issue';
+      claim: ClaimRecord;
+      issue: GitHubIssue;
+    }
+  | {
+      ok: false;
+      reason?: string;
+      message?: string;
+    };
+
 export type ClaimEventType =
   | 'claim.created'
   | 'claim.released'
   | 'claim.updated'
   | 'claim.stale'
   | 'claim.auto_released'
+  | 'followup.created'
+  | 'followup.claimed'
+  | 'followup.updated'
+  | 'followup.done'
+  | 'followup.dismissed'
+  | 'followup.stale'
+  | 'webhook.received'
+  | 'webhook.rejected'
   | 'sync.reconciled';
 
 export interface ClaimEvent {
@@ -123,8 +220,10 @@ export interface ClaimEvent {
   type: ClaimEventType;
   timestamp: string;
   claim_id?: string;
+  work_item_id?: string;
   repo?: string;
   issue_number?: number;
+  pr_number?: number;
   agent_id?: string;
   details?: Record<string, unknown>;
 }
@@ -136,6 +235,13 @@ export interface PersistedState {
   last_github_sync_at?: string;
   active_claims: ClaimRecord[];
   history: ClaimRecord[];
+}
+
+export interface FollowupPersistedState {
+  version: number;
+  active_followups: PrFollowupRecord[];
+  history: PrFollowupRecord[];
+  seen_source_event_ids: string[];
 }
 
 export interface HistoryPage {
@@ -155,14 +261,39 @@ export interface SystemHealth {
 export interface AppConfig {
   githubToken: string;
   httpPort: number;
+  persistenceBackend: 'sqlite' | 'json';
+  sqlitePath: string;
+  sqliteBusyTimeoutMs: number;
+  sqliteJournalMode: string;
+  migrateJsonToSqlite: boolean;
+  webhookDedupeMaxEntries: number;
+  webhookEnabled: boolean;
+  webhookPath: string;
+  githubWebhookSecret?: string;
   claimTimeoutMinutes: number;
   staleAutoReleaseMinutes: number;
+  followupStaleMinutes: number;
+  followupMaxEntries: number;
+  historyMaxEntries: number;
+  trustProxy: boolean;
   stateFilePath: string;
+  followupStateFilePath: string;
   syncIntervalMinutes: number;
   allowedRepos: Set<string>;
   logFile?: string;
   apiKey: string;
   autoCloseGithubIssue: boolean;
+  rateLimit: RateLimitConfig;
+}
+
+export interface RateLimitConfig {
+  enabled: boolean;
+  ipPerMinute: number;
+  ipBurst: number;
+  agentMutationsPerMinute: number;
+  agentMutationsBurst: number;
+  sseConnectPerMinute: number;
+  sseConnectBurst: number;
 }
 
 export interface SyncReport {

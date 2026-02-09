@@ -1,14 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { ClaimManager } from './claim-manager';
+import { FollowupManager } from './followup-manager';
+import { GitHubWebhookConnector } from './github-webhook';
 import { Logger } from './logger';
+import { TokenBucketLimiter } from './rate-limit';
 import { SyncService } from './sync';
-import { AppConfig, ClaimEvent, ClaimStatus } from './types';
+import { AppConfig, ClaimEvent, ClaimStatus, FollowupStatus } from './types';
 import { IssueCommandService } from './issuecommand-service';
 
 interface HttpServerOptions {
   service: IssueCommandService;
   claims: ClaimManager;
+  followups?: FollowupManager;
   sync: SyncService;
+  webhooks?: GitHubWebhookConnector;
   config: AppConfig;
   logger: Logger;
 }
@@ -27,6 +32,24 @@ const SSE_HEADERS = {
 export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
   const sseClients = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
   const encoder = new TextEncoder();
+  const ipLimiter = options.config.rateLimit.enabled
+    ? new TokenBucketLimiter({
+        ratePerMinute: options.config.rateLimit.ipPerMinute,
+        burst: options.config.rateLimit.ipBurst,
+      })
+    : undefined;
+  const mutationLimiter = options.config.rateLimit.enabled
+    ? new TokenBucketLimiter({
+        ratePerMinute: options.config.rateLimit.agentMutationsPerMinute,
+        burst: options.config.rateLimit.agentMutationsBurst,
+      })
+    : undefined;
+  const sseConnectLimiter = options.config.rateLimit.enabled
+    ? new TokenBucketLimiter({
+        ratePerMinute: options.config.rateLimit.sseConnectPerMinute,
+        burst: options.config.rateLimit.sseConnectBurst,
+      })
+    : undefined;
 
   const broadcast = (event: ClaimEvent): void => {
     const payload = encodeSseEvent(encoder, event.type, event, event.event_id);
@@ -42,14 +65,20 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
 
   const unsubscribeClaims = options.claims.onEvent(broadcast);
   const unsubscribeSync = options.sync.onEvent(broadcast);
+  const unsubscribeFollowups = options.followups?.onEvent(broadcast);
+  const unsubscribeWebhooks = options.webhooks?.onEvent(broadcast);
 
   const server = Bun.serve({
     port: options.config.httpPort,
-    fetch: async (request) => {
+    fetch: async (request, server) => {
       const url = new URL(request.url);
       const pathname = url.pathname;
+      const webhookPath = options.config.webhookPath;
+      const isWebhookPath = options.config.webhookEnabled && pathname === webhookPath;
+      const clientIp = getClientIp(request, server, options.config.trustProxy);
 
-      if ((pathname.startsWith('/api') || pathname === '/sse') && !isAuthorized(request, options.config.apiKey)) {
+      const requiresApiAuth = (pathname.startsWith('/api') || pathname === '/sse') && !isWebhookPath;
+      if (requiresApiAuth && !isAuthorized(request, options.config.apiKey)) {
         return json(
           {
             ok: false,
@@ -59,11 +88,43 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
         );
       }
 
+      if (pathname.startsWith('/api')) {
+        const perIpLimit = checkRateLimit(ipLimiter, `ip:${clientIp}`);
+        if (perIpLimit) {
+          return rateLimitResponse('ip', perIpLimit);
+        }
+      }
+
       if (request.method === 'GET' && pathname === '/sse') {
+        const sseLimit = checkRateLimit(sseConnectLimiter, `sse:${clientIp}`);
+        if (sseLimit) {
+          return rateLimitResponse('sse_connect', sseLimit);
+        }
+
         return handleSseRequest(request, sseClients, encoder);
       }
 
       try {
+        if (request.method === 'POST' && isWebhookPath) {
+          if (!options.webhooks) {
+            return json(
+              {
+                ok: false,
+                error: 'webhook_not_configured',
+              },
+              503,
+            );
+          }
+
+          const rawBody = await request.text();
+          const response = await options.webhooks.process({
+            headers: request.headers,
+            rawBody,
+          });
+
+          return json(response.body, response.status);
+        }
+
         if (request.method === 'GET' && pathname === '/api/repos') {
           const includeCounts = url.searchParams.get('include_counts') !== 'false';
           const response = await options.service.listRepos({ include_counts: includeCounts });
@@ -94,40 +155,135 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
 
         if (request.method === 'POST' && pathname === '/api/claims') {
           const body = await parseJsonBody(request);
+          const agentId = requireString(body, 'agent_id');
+          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          if (mutationLimit) {
+            return rateLimitResponse('agent_mutation', mutationLimit);
+          }
+
           const response = await options.service.claimIssue({
-            agent_id: requireString(body, 'agent_id'),
+            agent_id: agentId,
             repo: requireString(body, 'repo'),
             issue_number: requireNumber(body, 'issue_number'),
           });
           return json(response, response.ok ? 200 : 409);
         }
 
+        if (request.method === 'POST' && pathname === '/api/next') {
+          const body = await parseJsonBody(request);
+          const agentId = requireString(body, 'agent_id');
+          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          if (mutationLimit) {
+            return rateLimitResponse('agent_mutation', mutationLimit);
+          }
+
+          const response = await options.service.nextIssue({
+            agent_id: agentId,
+            repo: optionalString(body, 'repo'),
+            label: optionalString(body, 'label'),
+            milestone: optionalString(body, 'milestone'),
+          });
+
+          return json(response, response.ok ? 200 : 409);
+        }
+
+        if (request.method === 'POST' && pathname === '/api/next-work') {
+          const body = await parseJsonBody(request);
+          const agentId = requireString(body, 'agent_id');
+          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          if (mutationLimit) {
+            return rateLimitResponse('agent_mutation', mutationLimit);
+          }
+
+          const response = await options.service.nextWork({
+            agent_id: agentId,
+            repo: optionalString(body, 'repo'),
+            label: optionalString(body, 'label'),
+            milestone: optionalString(body, 'milestone'),
+          });
+
+          return json(response, response.ok ? 200 : 409);
+        }
+
+        if (request.method === 'GET' && pathname === '/api/followups') {
+          const response = options.service.getFollowups({
+            repo: url.searchParams.get('repo') ?? undefined,
+            status: optionalFollowupStatus(url.searchParams.get('status')),
+            claimed_by_agent_id: url.searchParams.get('claimed_by_agent_id') ?? undefined,
+            pr_number: optionalNumber(url.searchParams.get('pr_number')),
+          });
+          return json(response);
+        }
+
+        if (request.method === 'GET' && pathname === '/api/my-work') {
+          const agentId = url.searchParams.get('agent_id');
+          if (!agentId || !agentId.trim()) {
+            throw new Error('Missing required query parameter: agent_id');
+          }
+
+          const response = options.service.getMyWork({
+            agent_id: agentId.trim(),
+          });
+          return json(response);
+        }
+
         const claimPathMatch = pathname.match(/^\/api\/claims\/([^/]+)$/);
         if (claimPathMatch && request.method === 'DELETE') {
           const claimId = claimPathMatch[1];
           const body = await parseJsonBody(request, { optional: true });
+          const agentId = requireString(body, 'agent_id');
+          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          if (mutationLimit) {
+            return rateLimitResponse('agent_mutation', mutationLimit);
+          }
 
           const response = await options.service.releaseIssue({
             claim_id: claimId,
-            agent_id: optionalString(body, 'agent_id'),
+            agent_id: agentId,
             reason: optionalString(body, 'reason'),
           });
 
-          return json(response, response.ok ? 200 : 404);
+          return json(response, claimMutationStatusCode(response));
         }
 
         if (claimPathMatch && request.method === 'PATCH') {
           const claimId = claimPathMatch[1];
           const body = await parseJsonBody(request);
+          const agentId = requireString(body, 'agent_id');
+          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          if (mutationLimit) {
+            return rateLimitResponse('agent_mutation', mutationLimit);
+          }
 
           const response = await options.service.updateClaimStatus({
             claim_id: claimId,
+            agent_id: agentId,
             status: requireStatus(body, 'status'),
             note: optionalString(body, 'note'),
             pr_url: optionalString(body, 'pr_url'),
           });
 
-          return json(response, response.ok ? 200 : 400);
+          return json(response, claimMutationStatusCode(response));
+        }
+
+        const followupPathMatch = pathname.match(/^\/api\/followups\/([^/]+)$/);
+        if (followupPathMatch && request.method === 'PATCH') {
+          const body = await parseJsonBody(request);
+          const agentId = requireString(body, 'agent_id');
+          const mutationLimit = checkRateLimit(mutationLimiter, `agent:${agentId}`);
+          if (mutationLimit) {
+            return rateLimitResponse('agent_mutation', mutationLimit);
+          }
+
+          const response = await options.service.updateFollowupStatus({
+            work_item_id: followupPathMatch[1],
+            status: requireFollowupStatus(body, 'status'),
+            note: optionalString(body, 'note'),
+            agent_id: agentId,
+          });
+
+          const statusCode = response.ok ? 200 : response.reason === 'not_found' ? 404 : 409;
+          return json(response, statusCode);
         }
 
         if (request.method === 'GET' && pathname === '/api/claims') {
@@ -173,6 +329,8 @@ export function startHttpServer(options: HttpServerOptions): RunningHttpServer {
     stop: () => {
       unsubscribeClaims();
       unsubscribeSync();
+      unsubscribeFollowups?.();
+      unsubscribeWebhooks?.();
       server.stop(true);
     },
   };
@@ -258,13 +416,100 @@ function isAuthorized(request: Request, apiKey: string): boolean {
   return value === `Bearer ${apiKey}`;
 }
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json',
+      ...(headers ?? {}),
     },
   });
+}
+
+function rateLimitResponse(
+  scope: 'ip' | 'agent_mutation' | 'sse_connect',
+  result: { retryAfterSeconds: number; remainingTokens: number },
+): Response {
+  return json(
+    {
+      ok: false,
+      error: 'rate_limited',
+      scope,
+      retry_after_seconds: result.retryAfterSeconds,
+      remaining_tokens: result.remainingTokens,
+    },
+    429,
+    {
+      'Retry-After': String(result.retryAfterSeconds),
+    },
+  );
+}
+
+function claimMutationStatusCode(result: {
+  ok: boolean;
+  reason?: 'already_claimed' | 'claim_not_found' | 'invalid_transition' | 'agent_mismatch' | string;
+}): number {
+  if (result.ok) {
+    return 200;
+  }
+
+  if (result.reason === 'claim_not_found') {
+    return 404;
+  }
+
+  if (
+    result.reason === 'agent_mismatch' ||
+    result.reason === 'invalid_transition' ||
+    result.reason === 'already_claimed'
+  ) {
+    return 409;
+  }
+
+  return 400;
+}
+
+function checkRateLimit(
+  limiter: TokenBucketLimiter | undefined,
+  key: string | undefined,
+): { retryAfterSeconds: number; remainingTokens: number } | null {
+  if (!limiter || !key) {
+    return null;
+  }
+
+  const result = limiter.consume(key);
+  if (result.allowed) {
+    return null;
+  }
+
+  return {
+    retryAfterSeconds: result.retryAfterSeconds,
+    remainingTokens: result.remainingTokens,
+  };
+}
+
+function getClientIp(request: Request, server: Bun.Server<any>, trustProxy: boolean): string {
+  if (trustProxy) {
+    // Forwarded headers are safe only when a trusted proxy sanitizes them.
+    const forwardedFor = request.headers.get('x-forwarded-for');
+    if (forwardedFor && forwardedFor.trim()) {
+      const first = forwardedFor.split(',')[0]?.trim();
+      if (first) {
+        return first;
+      }
+    }
+
+    const realIp = request.headers.get('x-real-ip');
+    if (realIp && realIp.trim()) {
+      return realIp.trim();
+    }
+  }
+
+  const socketAddress = server.requestIP(request);
+  if (socketAddress?.address) {
+    return socketAddress.address;
+  }
+
+  return 'unknown';
 }
 
 async function parseJsonBody(
@@ -320,6 +565,19 @@ function requireNumber(body: Record<string, unknown>, key: string): number {
   return value;
 }
 
+function optionalNumber(value: string | null): number | undefined {
+  if (!value || !value.trim()) {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+
+  return parsed;
+}
+
 function requireStatus(body: Record<string, unknown>, key: string): ClaimStatus {
   const value = body[key];
   const status = typeof value === 'string' ? value : '';
@@ -356,4 +614,25 @@ function optionalStatus(value: string | null): ClaimStatus | undefined {
   ];
 
   return validStatuses.includes(value as ClaimStatus) ? (value as ClaimStatus) : undefined;
+}
+
+function requireFollowupStatus(body: Record<string, unknown>, key: string): FollowupStatus {
+  const value = body[key];
+  const status = typeof value === 'string' ? value : '';
+  const validStatuses: FollowupStatus[] = ['queued', 'claimed', 'in_progress', 'done', 'dismissed', 'stale'];
+
+  if (!validStatuses.includes(status as FollowupStatus)) {
+    throw new Error(`Invalid follow-up status: ${String(value)}`);
+  }
+
+  return status as FollowupStatus;
+}
+
+function optionalFollowupStatus(value: string | null): FollowupStatus | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const validStatuses: FollowupStatus[] = ['queued', 'claimed', 'in_progress', 'done', 'dismissed', 'stale'];
+  return validStatuses.includes(value as FollowupStatus) ? (value as FollowupStatus) : undefined;
 }

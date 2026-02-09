@@ -11,8 +11,9 @@ It runs two transports in one process:
 - Claim exclusivity with per-issue locking.
 - Idempotent re-claim for the current owner.
 - Stale detection and optional auto-release.
+- PR follow-up queue from GitHub webhook events (`changes_requested`, PR comments, review comments).
 - GitHub sync for external closures and metadata updates.
-- Crash recovery through debounced JSON state persistence.
+- Crash recovery through durable SQLite persistence (relational row-level writes, with legacy JSON fallback).
 - Real-time claim/sync events via SSE.
 
 ## Requirements
@@ -23,7 +24,7 @@ It runs two transports in one process:
   - `read:org`
   - `read:issue`
   - `write:issue`
-- GitHub CLI (`gh`) available on PATH (IssueCommand uses `gh` where practical and falls back to REST API).
+- GitHub CLI (`gh`) is optional; IssueCommand uses it when available and falls back to REST API automatically.
 
 ## Setup
 
@@ -49,6 +50,8 @@ bun run start
 
 `HTTP_PORT` defaults to `3100`.
 
+`PERSISTENCE_BACKEND` defaults to `sqlite`, so state is persisted in a local SQLite DB file (`SQLITE_PATH`) and survives restarts/redeployments.
+
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -56,13 +59,34 @@ bun run start
 | `GITHUB_TOKEN` | yes | - | GitHub PAT used for API/CLI auth |
 | `API_KEY` | yes | - | Required bearer token for all HTTP endpoints and SSE |
 | `HTTP_PORT` | no | `3100` | HTTP/SSE port |
+| `TRUST_PROXY` | no | `false` | Trust `x-forwarded-for` / `x-real-ip` for client IP derivation (set `true` only behind a trusted proxy) |
+| `PERSISTENCE_BACKEND` | no | `sqlite` | Persistence backend (`sqlite` or legacy `json`) |
+| `SQLITE_PATH` | no | `./issuecommand.db` | SQLite database file path for durable local persistence |
+| `SQLITE_BUSY_TIMEOUT_MS` | no | `5000` | SQLite busy timeout for concurrent access retries |
+| `SQLITE_JOURNAL_MODE` | no | `WAL` | SQLite journal mode (recommended: `WAL`) |
+| `MIGRATE_JSON_TO_SQLITE` | no | `true` | Auto-import legacy JSON files and snapshot-table state into relational SQLite when DB is empty |
+| `WEBHOOK_DEDUPE_MAX_ENTRIES` | no | `20000` | Max persisted GitHub webhook delivery IDs retained for duplicate protection |
+| `WEBHOOK_ENABLED` | no | `true` | Enable GitHub webhook ingestion endpoint |
+| `WEBHOOK_PATH` | no | `/api/webhooks/github` | Path used for GitHub webhook ingestion |
+| `GITHUB_WEBHOOK_SECRET` | no | `""` | HMAC secret for GitHub webhook signatures (`X-Hub-Signature-256`) |
 | `CLAIM_TIMEOUT_MINUTES` | no | `120` | Minutes since last update before claim is marked stale |
 | `STALE_AUTO_RELEASE_MINUTES` | no | `0` | Minutes after stale before auto-release (`0` disables) |
 | `AUTO_CLOSE_GITHUB_ISSUE` | no | `false` | If `true`, close GitHub issue when claim status becomes `closed` |
-| `STATE_FILE_PATH` | no | `./issuecommand-state.json` | Persisted claim state file |
+| `HISTORY_MAX_ENTRIES` | no | `1000` | Maximum number of completed/released claims retained in memory/state |
+| `FOLLOWUP_STALE_MINUTES` | no | `1440` | Minutes since last update before an active follow-up is marked stale |
+| `FOLLOWUP_MAX_ENTRIES` | no | `2000` | Maximum number of completed/dismissed follow-ups retained in memory/state |
+| `STATE_FILE_PATH` | no | `./issuecommand-state.json` | Legacy JSON claim state path (and migration source when using SQLite) |
+| `FOLLOWUP_STATE_FILE_PATH` | no | `./issuecommand-followups-state.json` | Legacy JSON follow-up state path (and migration source when using SQLite) |
 | `SYNC_INTERVAL_MINUTES` | no | `15` | GitHub reconciliation interval |
 | `ALLOWED_REPOS` | no | `""` | Comma-separated `owner/repo` whitelist |
 | `LOG_FILE` | no | `""` | Optional JSON log output file |
+| `RATE_LIMIT_ENABLED` | no | `true` | Enable in-memory HTTP throttling |
+| `RATE_LIMIT_IP_PER_MINUTE` | no | `120` | Per-IP request refill rate for `/api/*` |
+| `RATE_LIMIT_IP_BURST` | no | `40` | Per-IP burst capacity for `/api/*` |
+| `RATE_LIMIT_AGENT_MUTATIONS_PER_MINUTE` | no | `40` | Per-agent refill rate for mutating claim routes |
+| `RATE_LIMIT_AGENT_MUTATIONS_BURST` | no | `20` | Per-agent burst for mutating claim routes |
+| `RATE_LIMIT_SSE_CONNECT_PER_MINUTE` | no | `10` | Per-IP SSE connection-attempt refill rate |
+| `RATE_LIMIT_SSE_CONNECT_BURST` | no | `10` | Per-IP SSE connection-attempt burst |
 
 ## MCP Tools
 
@@ -70,21 +94,35 @@ bun run start
 - `list_open_issues`
 - `get_issue_details`
 - `next_issue`
+- `next_work`
 - `claim_issue`
 - `release_issue`
 - `update_claim_status`
+- `get_followups`
+- `update_followup_status`
 - `get_my_claims`
+- `get_my_work`
 - `get_all_claims`
 - `get_claim_history`
 - `system_health`
 
+### Claim Mutation Tool Inputs
+
+- `release_issue` requires `claim_id` and `agent_id` (`reason` optional).
+- `update_claim_status` requires `claim_id`, `agent_id`, and `status` (`note`/`pr_url` optional).
+
 ## HTTP API
 
-All endpoints require:
+All HTTP endpoints except webhook ingestion require:
 
 ```http
 Authorization: Bearer <API_KEY>
 ```
+
+Webhook ingestion (`WEBHOOK_PATH`, default `/api/webhooks/github`) accepts either:
+
+- `Authorization: Bearer <API_KEY>`
+- GitHub `X-Hub-Signature-256` validated with `GITHUB_WEBHOOK_SECRET`
 
 ### Endpoints
 
@@ -92,9 +130,15 @@ Authorization: Bearer <API_KEY>
 - `GET /api/repos`
 - `GET /api/repos/:owner/:repo/issues`
 - `GET /api/issues/:owner/:repo/:number`
+- `POST /api/next`
+- `POST /api/next-work`
 - `POST /api/claims`
 - `DELETE /api/claims/:claim_id`
 - `PATCH /api/claims/:claim_id`
+- `GET /api/followups`
+- `PATCH /api/followups/:work_item_id`
+- `GET /api/my-work`
+- `POST /api/webhooks/github` (or configured `WEBHOOK_PATH`, auth via API key or GitHub signature)
 - `GET /api/claims`
 - `GET /api/health`
 
@@ -116,13 +160,40 @@ curl -X POST http://localhost:3100/api/claims \
   -d '{"agent_id":"claude-code-macmini-1","repo":"myorg/api","issue_number":42}'
 ```
 
+Claim next issue in one call:
+
+```bash
+curl -X POST http://localhost:3100/api/next \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"claude-code-macmini-1","repo":"myorg/api"}'
+```
+
+Claim next work item (PR follow-up first, issue fallback):
+
+```bash
+curl -X POST http://localhost:3100/api/next-work \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"claude-code-macmini-1","repo":"myorg/api"}'
+```
+
 Update status:
 
 ```bash
 curl -X PATCH http://localhost:3100/api/claims/<claim_id> \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"status":"in_progress"}'
+  -d '{"agent_id":"claude-code-macmini-1","status":"in_progress"}'
+```
+
+Release claim:
+
+```bash
+curl -X DELETE http://localhost:3100/api/claims/<claim_id> \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"claude-code-macmini-1","reason":"handing off"}'
 ```
 
 Subscribe to events:
@@ -131,19 +202,34 @@ Subscribe to events:
 curl -N -H "Authorization: Bearer $API_KEY" http://localhost:3100/sse
 ```
 
+Send a signed GitHub webhook (example):
+
+```bash
+BODY='{"action":"submitted","repository":{"full_name":"myorg/api"}}'
+SIG="sha256=$(printf "%s" "$BODY" | openssl dgst -sha256 -hmac "$GITHUB_WEBHOOK_SECRET" -hex | sed 's/^.* //')"
+
+curl -X POST http://localhost:3100/api/webhooks/github \
+  -H "Content-Type: application/json" \
+  -H "X-GitHub-Event: pull_request_review" \
+  -H "X-GitHub-Delivery: demo-delivery-id" \
+  -H "X-Hub-Signature-256: $SIG" \
+  -d "$BODY"
+```
+
 ## Example Agent Workflow
 
-1. Agent requests next issue:
+1. Agent requests next work:
 
 ```json
 {"agent_id":"claude-code-1","repo":"myorg/api"}
 ```
 
-2. IssueCommand returns claim + issue details.
-3. Agent updates status to `in_progress`.
-4. Agent updates status to `pr_submitted` with `pr_url`.
-5. Agent updates status to `pr_merged`.
-6. Agent updates status to `closed`.
+2. IssueCommand returns either:
+   - PR follow-up work item (`kind: "pr_followup"`) when review feedback is queued, or
+   - issue claim + issue details (`kind: "issue"`) when no follow-up is queued.
+3. For issue work, agent updates claim status through `in_progress` -> `pr_submitted` -> `pr_merged` -> `closed`.
+4. For follow-up work, agent updates follow-up status (typically `in_progress` then `done`).
+5. GitHub webhook events can enqueue new follow-up work or auto-resolve stale follow-ups on PR `synchronize`.
 
 ## Deployment
 
@@ -170,7 +256,7 @@ Stop:
 bun run docker:down
 ```
 
-The container persists state at `/app/data/issuecommand-state.json` via the named volume.
+The container persists state at `/app/data/issuecommand.db` (plus any configured legacy JSON files) via the named volume.
 
 ### Host Process Manager (PM2)
 
@@ -211,13 +297,34 @@ bun run pm2:stop
         "GITHUB_TOKEN": "ghp_your_token",
         "API_KEY": "shared-secret",
         "HTTP_PORT": "3100",
+        "TRUST_PROXY": "false",
+        "PERSISTENCE_BACKEND": "sqlite",
+        "SQLITE_PATH": "/absolute/path/to/issuecommand/issuecommand.db",
+        "SQLITE_BUSY_TIMEOUT_MS": "5000",
+        "SQLITE_JOURNAL_MODE": "WAL",
+        "MIGRATE_JSON_TO_SQLITE": "true",
+        "WEBHOOK_DEDUPE_MAX_ENTRIES": "20000",
+        "WEBHOOK_ENABLED": "true",
+        "WEBHOOK_PATH": "/api/webhooks/github",
+        "GITHUB_WEBHOOK_SECRET": "",
         "CLAIM_TIMEOUT_MINUTES": "120",
         "STALE_AUTO_RELEASE_MINUTES": "0",
+        "HISTORY_MAX_ENTRIES": "1000",
+        "FOLLOWUP_STALE_MINUTES": "1440",
+        "FOLLOWUP_MAX_ENTRIES": "2000",
         "STATE_FILE_PATH": "/absolute/path/to/issuecommand/issuecommand-state.json",
+        "FOLLOWUP_STATE_FILE_PATH": "/absolute/path/to/issuecommand/issuecommand-followups-state.json",
         "SYNC_INTERVAL_MINUTES": "15",
         "ALLOWED_REPOS": "",
         "LOG_FILE": "",
-        "AUTO_CLOSE_GITHUB_ISSUE": "false"
+        "AUTO_CLOSE_GITHUB_ISSUE": "false",
+        "RATE_LIMIT_ENABLED": "true",
+        "RATE_LIMIT_IP_PER_MINUTE": "120",
+        "RATE_LIMIT_IP_BURST": "40",
+        "RATE_LIMIT_AGENT_MUTATIONS_PER_MINUTE": "40",
+        "RATE_LIMIT_AGENT_MUTATIONS_BURST": "20",
+        "RATE_LIMIT_SSE_CONNECT_PER_MINUTE": "10",
+        "RATE_LIMIT_SSE_CONNECT_BURST": "10"
       }
     }
   }
@@ -234,4 +341,18 @@ bun test
 ## Notes
 
 - Logs are emitted on stderr to avoid interfering with MCP stdio protocol output.
-- State is persisted on claim mutations with debounced writes and loaded on startup.
+- By default, state is persisted to SQLite (`SQLITE_PATH`) and loaded on startup.
+- SQLite persistence uses relational tables with incremental row updates (active claims/followups, history, and runtime metadata), not full-state blob rewrites.
+- Legacy JSON files and legacy SQLite snapshot namespaces can be auto-imported once into relational SQLite tables when `MIGRATE_JSON_TO_SQLITE=true`.
+- Completed claim history is bounded by `HISTORY_MAX_ENTRIES`; oldest records are trimmed first.
+- Follow-up history is bounded by `FOLLOWUP_MAX_ENTRIES`; oldest records are trimmed first.
+- Webhook delivery dedupe keys are also persisted in SQLite for duplicate protection across restarts.
+- Startup logs include `gh` CLI availability (`github.gh.available` or `github.gh.unavailable`).
+- HTTP rate limiting returns `429` with a `Retry-After` header and JSON body `{ error: \"rate_limited\", scope, retry_after_seconds }`.
+- `TRUST_PROXY=false` is the safe default; enable it only when a trusted reverse proxy sanitizes forwarding headers.
+- Webhook ingestion accepts either `Authorization: Bearer <API_KEY>` or GitHub `X-Hub-Signature-256` when `GITHUB_WEBHOOK_SECRET` is set.
+- Breaking change: claim mutation routes/tools now require `agent_id`:
+  - HTTP `PATCH /api/claims/:claim_id`
+  - HTTP `DELETE /api/claims/:claim_id`
+  - MCP `update_claim_status`
+  - MCP `release_issue`

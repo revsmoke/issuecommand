@@ -3,9 +3,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { ClaimManager } from '../src/claim-manager';
+import { FollowupManager } from '../src/followup-manager';
 import { IssueCommandService } from '../src/issuecommand-service';
 import { Logger } from '../src/logger';
 import { StatePersistence } from '../src/state-persistence';
+import type { FollowupPersistedState } from '../src/types';
 import { buildIssue, FakeGitHubClient } from './test-helpers';
 
 const tempDirs: string[] = [];
@@ -85,22 +87,26 @@ describe('IssueCommandService', () => {
 
     await service.updateClaimStatus({
       claim_id: claimId!,
+      agent_id: 'agent-1',
       status: 'in_progress',
     });
 
     await service.updateClaimStatus({
       claim_id: claimId!,
+      agent_id: 'agent-1',
       status: 'pr_submitted',
       pr_url: 'https://github.com/acme/api/pull/10',
     });
 
     await service.updateClaimStatus({
       claim_id: claimId!,
+      agent_id: 'agent-1',
       status: 'pr_merged',
     });
 
     const closedResult = await service.updateClaimStatus({
       claim_id: claimId!,
+      agent_id: 'agent-1',
       status: 'closed',
     });
 
@@ -109,6 +115,82 @@ describe('IssueCommandService', () => {
 
     const issue = await github.getIssueDetails('acme/api', 99);
     expect(issue.state).toBe('closed');
+  });
+
+  test('nextWork prioritizes PR followups before claiming new issues', async () => {
+    const github = new FakeGitHubClient({
+      issues: [
+        buildIssue({
+          repo: 'acme/api',
+          number: 42,
+          labels: ['P0'],
+        }),
+      ],
+    });
+
+    const { service, followups } = await createServiceTestContextWithFollowups(github, {
+      autoCloseGithubIssue: false,
+    });
+
+    const createResult = await followups.createFromWebhook({
+      repo: 'acme/api',
+      pr_number: 501,
+      pr_url: 'https://github.com/acme/api/pull/501',
+      pr_title: 'Fix webhook retries',
+      source_event_type: 'review_changes_requested',
+      source_event_id: 'review:5001',
+      summary: 'Please address review comments',
+      actionable_comments: ['Please address review comments'],
+    });
+    expect(createResult.ok).toBeTrue();
+
+    const nextWork = await service.nextWork({
+      agent_id: 'agent-followup',
+      repo: 'acme/api',
+    });
+
+    expect(nextWork.ok).toBeTrue();
+    if (!nextWork.ok) {
+      return;
+    }
+
+    expect(nextWork.kind).toBe('pr_followup');
+    if (nextWork.kind === 'pr_followup') {
+      expect(nextWork.work_item.pr_number).toBe(501);
+      expect(nextWork.work_item.status).toBe('claimed');
+    }
+  });
+
+  test('nextWork falls back to issue when no followups are queued', async () => {
+    const github = new FakeGitHubClient({
+      issues: [
+        buildIssue({
+          repo: 'acme/api',
+          number: 88,
+          labels: ['P0'],
+        }),
+      ],
+    });
+
+    const { service } = await createServiceTestContextWithFollowups(github, {
+      autoCloseGithubIssue: false,
+    });
+
+    const nextWork = await service.nextWork({
+      agent_id: 'agent-issue',
+      repo: 'acme/api',
+    });
+
+    expect(nextWork.ok).toBeTrue();
+    if (!nextWork.ok) {
+      return;
+    }
+
+    expect(nextWork.kind).toBe('issue');
+    if (nextWork.kind === 'issue') {
+      expect(nextWork.issue.number).toBe(88);
+      expect(nextWork.claim.status).toBe('claimed');
+    }
   });
 });
 
@@ -129,6 +211,7 @@ async function createServiceTestContext(
   const claimManager = new ClaimManager({
     claimTimeoutMinutes: 120,
     staleAutoReleaseMinutes: 0,
+    historyMaxEntries: 1000,
     persistence,
     logger,
   });
@@ -141,4 +224,54 @@ async function createServiceTestContext(
     logger,
     autoCloseGithubIssue: options.autoCloseGithubIssue,
   });
+}
+
+async function createServiceTestContextWithFollowups(
+  github: FakeGitHubClient,
+  options: { autoCloseGithubIssue: boolean },
+): Promise<{ service: IssueCommandService; followups: FollowupManager }> {
+  const tempDir = await mkdtemp(join(tmpdir(), 'issuecommand-service-followups-'));
+  tempDirs.push(tempDir);
+
+  const logger = new Logger({ silent: true });
+  const claimPersistence = new StatePersistence({
+    filePath: join(tempDir, 'state.json'),
+    logger,
+    debounceMs: 5,
+  });
+  const followupPersistence = new StatePersistence<FollowupPersistedState>({
+    filePath: join(tempDir, 'followups-state.json'),
+    logger,
+    debounceMs: 5,
+  });
+
+  const claimManager = new ClaimManager({
+    claimTimeoutMinutes: 120,
+    staleAutoReleaseMinutes: 0,
+    historyMaxEntries: 1000,
+    persistence: claimPersistence,
+    logger,
+  });
+  await claimManager.initialize();
+
+  const followups = new FollowupManager({
+    persistence: followupPersistence,
+    logger,
+    maxEntries: 1000,
+    staleMinutes: 1440,
+  });
+  await followups.initialize();
+
+  const service = new IssueCommandService({
+    claims: claimManager,
+    followups,
+    github,
+    logger,
+    autoCloseGithubIssue: options.autoCloseGithubIssue,
+  });
+
+  return {
+    service,
+    followups,
+  };
 }

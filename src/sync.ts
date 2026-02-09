@@ -21,6 +21,8 @@ export class SyncService {
   private readonly allowedRepos: Set<string>;
   private readonly events = new EventEmitter();
   private readonly knownOpenIssues = new Map<string, Set<number>>();
+  private syncRunInFlight = false;
+  private syncRunPending = false;
   private timer?: ReturnType<typeof setInterval>;
 
   constructor(options: SyncServiceOptions) {
@@ -44,10 +46,10 @@ export class SyncService {
     }
 
     this.timer = setInterval(() => {
-      void this.runOnce();
+      void this.scheduleSyncRun('interval');
     }, this.intervalMs);
 
-    void this.runOnce();
+    void this.scheduleSyncRun('startup');
   }
 
   stop(): void {
@@ -57,6 +59,7 @@ export class SyncService {
 
     clearInterval(this.timer);
     this.timer = undefined;
+    this.syncRunPending = false;
   }
 
   async runOnce(): Promise<SyncReport> {
@@ -167,5 +170,37 @@ export class SyncService {
 
     const repos = await this.github.listRepos({ includeCounts: false });
     return repos.map((repo) => repo.full_name).sort();
+  }
+
+  private async scheduleSyncRun(trigger: 'startup' | 'interval'): Promise<void> {
+    if (this.syncRunInFlight) {
+      this.syncRunPending = true;
+      return;
+    }
+
+    this.syncRunInFlight = true;
+    let runTrigger = trigger;
+
+    try {
+      while (true) {
+        try {
+          await this.runOnce();
+        } catch (error) {
+          this.logger.error('sync.run_failed', {
+            trigger: runTrigger,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+
+        if (!this.syncRunPending) {
+          break;
+        }
+
+        this.syncRunPending = false;
+        runTrigger = 'interval';
+      }
+    } finally {
+      this.syncRunInFlight = false;
+    }
   }
 }

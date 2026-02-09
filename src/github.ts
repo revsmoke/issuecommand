@@ -6,6 +6,7 @@ interface GitHubServiceOptions {
   token: string;
   logger: Logger;
   allowedRepos: Set<string>;
+  execCommandFn?: ExecCommandFn;
 }
 
 export interface GitHubClient {
@@ -14,6 +15,18 @@ export interface GitHubClient {
   getIssueDetails(repo: string, issueNumber: number): Promise<GitHubIssue>;
   closeIssue(repo: string, issueNumber: number): Promise<boolean>;
 }
+
+export interface GhAvailabilityResult {
+  available: boolean;
+  version?: string;
+  reason?: string;
+}
+
+type ExecCommandFn = (
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 interface RestRepo {
   full_name: string;
@@ -55,11 +68,40 @@ export class GitHubService implements GitHubClient {
   private readonly token: string;
   private readonly logger: Logger;
   private readonly allowedRepos: Set<string>;
+  private readonly execCommandFn: ExecCommandFn;
 
   constructor(options: GitHubServiceOptions) {
     this.token = options.token;
     this.logger = options.logger;
     this.allowedRepos = options.allowedRepos;
+    this.execCommandFn = options.execCommandFn ?? execCommand;
+  }
+
+  async checkGhAvailability(): Promise<GhAvailabilityResult> {
+    try {
+      const { code, stdout, stderr } = await this.execCommandFn('gh', ['--version'], this.buildGhEnv());
+      if (code !== 0) {
+        return {
+          available: false,
+          reason: (stderr || stdout || `gh exited with code ${code}`).trim(),
+        };
+      }
+
+      const version = stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+
+      return {
+        available: true,
+        version,
+      };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   async listRepos(options: { includeCounts?: boolean } = {}): Promise<RepoSummary[]> {
@@ -377,11 +419,7 @@ export class GitHubService implements GitHubClient {
   }
 
   private async execGhJson<T>(args: string[]): Promise<T> {
-    const { code, stdout, stderr } = await execCommand('gh', args, {
-      ...process.env,
-      GH_TOKEN: this.token,
-      GITHUB_TOKEN: this.token,
-    });
+    const { code, stdout, stderr } = await this.execCommandFn('gh', args, this.buildGhEnv());
 
     if (code !== 0) {
       throw new Error(`gh command failed: gh ${args.join(' ')} :: ${stderr}`);
@@ -392,6 +430,14 @@ export class GitHubService implements GitHubClient {
     }
 
     return JSON.parse(stdout) as T;
+  }
+
+  private buildGhEnv(): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      GH_TOKEN: this.token,
+      GITHUB_TOKEN: this.token,
+    };
   }
 
   private isRepoAllowed(repo: string): boolean {

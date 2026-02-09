@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import * as z from 'zod/v4';
 import { Logger } from './logger';
-import { ClaimStatus } from './types';
+import { ClaimStatus, FollowupStatus } from './types';
 import { IssueCommandService } from './issuecommand-service';
 
 interface McpServerOptions {
@@ -21,6 +21,15 @@ const STATUS_SCHEMA = z.enum([
   'pr_merged',
   'closed',
   'released',
+  'stale',
+]);
+
+const FOLLOWUP_STATUS_SCHEMA = z.enum([
+  'queued',
+  'claimed',
+  'in_progress',
+  'done',
+  'dismissed',
   'stale',
 ]);
 
@@ -107,6 +116,23 @@ function registerTools(server: McpServer, service: IssueCommandService): void {
   );
 
   server.registerTool(
+    'next_work',
+    {
+      description:
+        'Claim next available work item for an agent, prioritizing PR follow-up tasks before new issues.',
+      inputSchema: {
+        agent_id: z.string(),
+        repo: z.string().optional(),
+        label: z.string().optional(),
+        milestone: z.string().optional(),
+      },
+    },
+    async ({ agent_id, repo, label, milestone }) => {
+      return asToolResult(await service.nextWork({ agent_id, repo, label, milestone }));
+    },
+  );
+
+  server.registerTool(
     'claim_issue',
     {
       description: 'Claim an issue for an agent.',
@@ -127,7 +153,7 @@ function registerTools(server: McpServer, service: IssueCommandService): void {
       description: 'Release a claim.',
       inputSchema: {
         claim_id: z.string(),
-        agent_id: z.string().optional(),
+        agent_id: z.string(),
         reason: z.string().optional(),
       },
     },
@@ -142,18 +168,66 @@ function registerTools(server: McpServer, service: IssueCommandService): void {
       description: 'Update claim status in the workflow lifecycle.',
       inputSchema: {
         claim_id: z.string(),
+        agent_id: z.string(),
         status: STATUS_SCHEMA,
         note: z.string().optional(),
         pr_url: z.string().optional(),
       },
     },
-    async ({ claim_id, status, note, pr_url }) => {
+    async ({ claim_id, agent_id, status, note, pr_url }) => {
       return asToolResult(
         await service.updateClaimStatus({
           claim_id,
+          agent_id,
           status: status as ClaimStatus,
           note,
           pr_url,
+        }),
+      );
+    },
+  );
+
+  server.registerTool(
+    'get_followups',
+    {
+      description: 'Get active PR follow-up work items with optional filters.',
+      inputSchema: {
+        repo: z.string().optional(),
+        status: FOLLOWUP_STATUS_SCHEMA.optional(),
+        claimed_by_agent_id: z.string().optional(),
+        pr_number: z.number().int().positive().optional(),
+      },
+    },
+    async ({ repo, status, claimed_by_agent_id, pr_number }) => {
+      return asToolResult(
+        service.getFollowups({
+          repo,
+          status: status as FollowupStatus | undefined,
+          claimed_by_agent_id,
+          pr_number,
+        }),
+      );
+    },
+  );
+
+  server.registerTool(
+    'update_followup_status',
+    {
+      description: 'Update PR follow-up status for an assigned agent work item.',
+      inputSchema: {
+        work_item_id: z.string(),
+        agent_id: z.string(),
+        status: FOLLOWUP_STATUS_SCHEMA,
+        note: z.string().optional(),
+      },
+    },
+    async ({ work_item_id, agent_id, status, note }) => {
+      return asToolResult(
+        await service.updateFollowupStatus({
+          work_item_id,
+          agent_id,
+          status: status as FollowupStatus,
+          note,
         }),
       );
     },
@@ -169,6 +243,19 @@ function registerTools(server: McpServer, service: IssueCommandService): void {
     },
     async ({ agent_id }) => {
       return asToolResult(service.getClaims({ agent_id }));
+    },
+  );
+
+  server.registerTool(
+    'get_my_work',
+    {
+      description: 'Get active claims and PR follow-up items currently assigned to an agent.',
+      inputSchema: {
+        agent_id: z.string(),
+      },
+    },
+    async ({ agent_id }) => {
+      return asToolResult(service.getMyWork({ agent_id }));
     },
   );
 
